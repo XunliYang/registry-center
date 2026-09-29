@@ -26,6 +26,7 @@ from google.protobuf.json_format import MessageToDict, Parse
 from loguru import logger
 
 from agent_registry.config import PERSISTENCE_METADATA_FILE, PERSISTENCE_TAGS_FILE
+from agent_registry.model.agent_layer import AgentLayer, LAYER_UNSET, default_layer, normalize_layer
 from agent_registry.model.tag import Tag
 from .base import StorageBackend, AgentRecord
 
@@ -44,6 +45,7 @@ class FileStorage(StorageBackend):
         self._agent_tags_map: Dict[tuple, List[str]] = {}
         self._created_at_map: Dict[tuple, str] = {}
         self._updated_at_map: Dict[tuple, str] = {}
+        self._layer_map: Dict[tuple, str] = {}
         self._tag_list: Dict[str, Tag] = {}
         self._load()
 
@@ -59,15 +61,18 @@ class FileStorage(StorageBackend):
         logger.info(f"FileStorage initialized with path: {file_path}")
         return instance
 
-    def create(self, agent: AgentCard, owner: Optional[str] = None, status: str = 'published') -> bool:
+    def create(self, agent: AgentCard, owner: Optional[str] = None,
+               status: str = 'published', layer: str = AgentLayer.UNKNOWN.value) -> bool:
         key = (agent.name.strip(), agent.provider.organization.strip())
         if key in self._agents:
             logger.warning(f"Agent already exists: {agent.name} (org={agent.provider.organization})")
             return False
+        layer = default_layer(layer)
         self._agents[key] = agent
         self._status_map[key] = status
         self._agent_tags_map[key] = []
         self._owner_map[key] = owner
+        self._layer_map[key] = layer
         now = datetime.now(timezone.utc).isoformat()
         self._created_at_map[key] = now
         self._updated_at_map[key] = now
@@ -89,7 +94,8 @@ class FileStorage(StorageBackend):
                 status=status,
                 created_at=self._created_at_map.get(key, ''),
                 updated_at=self._updated_at_map.get(key, ''),
-                tags=self._agent_tags_map.get(key, [])
+                tags=self._agent_tags_map.get(key, []),
+                layer=self._layer_map.get(key, AgentLayer.UNKNOWN.value),
             )
         return None
 
@@ -110,6 +116,36 @@ class FileStorage(StorageBackend):
     def find_all(self) -> List[AgentCard]:
         return list(self._agents.values())
 
+    def find_records(self, name: Optional[str] = None,
+                     organization: Optional[str] = None,
+                     layer: Optional[str] = None,
+                     status: Optional[str] = None) -> List[AgentRecord]:
+        """Find registration records, including the stored layer metadata."""
+
+        normalized_layer = normalize_layer(layer) if layer is not None else None
+        records = []
+        for key, agent in self._agents.items():
+            if name is not None and name.lower() not in agent.name.lower():
+                continue
+            if organization is not None and agent.provider.organization != organization:
+                continue
+            stored_layer = self._layer_map.get(key, AgentLayer.UNKNOWN.value)
+            if normalized_layer is not None and stored_layer != normalized_layer:
+                continue
+            stored_status = self._status_map.get(key, 'published')
+            if status is not None and stored_status != status:
+                continue
+            records.append(AgentRecord(
+                agent_card=agent,
+                owner=self._owner_map.get(key),
+                status=stored_status,
+                created_at=self._created_at_map.get(key, ''),
+                updated_at=self._updated_at_map.get(key, ''),
+                tags=self._agent_tags_map.get(key, []),
+                layer=stored_layer,
+            ))
+        return records
+
     def find_by_status(self, status: str) -> List[AgentCard]:
         result = []
         for key, agent in self._agents.items():
@@ -128,7 +164,8 @@ class FileStorage(StorageBackend):
         logger.info(f"Agent status updated: {name} -> {new_status}")
         return True
 
-    def update(self, name: str, organization: str, agent_data: Dict[str, Any], owner: Optional[str] = None) -> bool:
+    def update(self, name: str, organization: str, agent_data: Dict[str, Any],
+               owner: Optional[str] = None, layer=LAYER_UNSET) -> bool:
         key = (name.strip(), organization.strip())
         existing_agent = self._agents.get(key)
         if not existing_agent:
@@ -147,6 +184,8 @@ class FileStorage(StorageBackend):
         self._agents[key] = new_agent
         if 'status' in agent_data:
             self._status_map[key] = agent_data['status']
+        if layer is not LAYER_UNSET:
+            self._layer_map[key] = normalize_layer(layer)
         self._updated_at_map[key] = datetime.now(timezone.utc).isoformat()
         self._save()
         logger.info(f"Updated agent: {new_agent.name}(org={new_agent.provider.organization}, owner={owner})")
@@ -173,6 +212,8 @@ class FileStorage(StorageBackend):
             del self._created_at_map[key]
         if key in self._updated_at_map:
             del self._updated_at_map[key]
+        if key in self._layer_map:
+            del self._layer_map[key]
         self._save()
         logger.info(f"Deregistered agent: {name}({organization}, owner={owner})")
         return True
@@ -241,7 +282,8 @@ class FileStorage(StorageBackend):
                         status=status,
                         created_at=self._created_at_map.get(key, ''),
                         updated_at=self._updated_at_map.get(key, ''),
-                        tags=self._agent_tags_map.get(key, [])
+                        tags=self._agent_tags_map.get(key, []),
+                        layer=self._layer_map.get(key, AgentLayer.UNKNOWN.value),
                     ))
         logger.debug(f"Found {len(result)} agents by owner '{owner}'")
         return result
@@ -255,6 +297,7 @@ class FileStorage(StorageBackend):
                 "status": status,
                 "owner": self._owner_map.get(key),
                 "tags": self._agent_tags_map.get(key, []),
+                "layer": self._layer_map.get(key, AgentLayer.UNKNOWN.value),
                 "created_at": self._created_at_map.get(key, ''),
                 "updated_at": self._updated_at_map.get(key, '')
             })
@@ -308,6 +351,7 @@ class FileStorage(StorageBackend):
                 self._status_map[key] = 'published'
                 self._owner_map[key] = None
                 self._agent_tags_map[key] = []
+                self._layer_map[key] = AgentLayer.UNKNOWN.value
                 self._created_at_map[key] = ''
                 self._updated_at_map[key] = ''
             logger.info("No registry file found, defaulting all agents to published status")
@@ -319,17 +363,41 @@ class FileStorage(StorageBackend):
             if not isinstance(registry_data, list):
                 logger.error(f"Invalid format in {self.metadata_file}: expected a list")
                 return
+            migration_needed = False
             for item in registry_data:
                 try:
                     key = (item['agent_name'].strip(), item['organization'].strip())
                     self._status_map[key] = item.get('status', 'published')
                     self._owner_map[key] = item.get('owner')
                     self._agent_tags_map[key] = item.get('tags', [])
+                    raw_layer = item.get('layer', AgentLayer.UNKNOWN.value)
+                    if 'layer' not in item:
+                        migration_needed = True
+                    try:
+                        self._layer_map[key] = normalize_layer(raw_layer)
+                    except ValueError:
+                        migration_needed = True
+                        logger.warning(
+                            f"Invalid layer in {self.metadata_file}; defaulting to unknown: {raw_layer}"
+                        )
+                        self._layer_map[key] = AgentLayer.UNKNOWN.value
                     self._created_at_map[key] = item.get('created_at', '')
                     self._updated_at_map[key] = item.get('updated_at', '')
                 except Exception as e:
                     logger.error(f"Failed to load status from JSON: {e}, data: {item}")
             logger.info(f"Loaded {len(self._status_map)} status mappings from {self.metadata_file}")
+            for key in self._agents:
+                self._status_map.setdefault(key, 'published')
+                self._owner_map.setdefault(key, None)
+                self._agent_tags_map.setdefault(key, [])
+                if key not in self._layer_map:
+                    self._layer_map[key] = AgentLayer.UNKNOWN.value
+                    migration_needed = True
+                self._created_at_map.setdefault(key, '')
+                self._updated_at_map.setdefault(key, '')
+            if migration_needed:
+                self._save_registry()
+                logger.info(f"Normalized layer metadata in {self.metadata_file}")
         except Exception as e:
             logger.error(f"Failed to load registry from {self.metadata_file}: {e}")
 

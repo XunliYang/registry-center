@@ -50,6 +50,10 @@ from agent_registry.server import (
     _is_hidden_unhealthy,
     _process_register_cards,
     _process_update_cards,
+    _normalize_agent_cards,
+    _parse_layer_query_body,
+    _registration_record_to_dict,
+    _published_healthy_records,
     _validate_callback_url,
 )
 from agent_registry.server import (
@@ -62,6 +66,7 @@ from agent_registry.server import (
 )
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
 from agent_registry.agent_registry.agent_card_signer import AgentCardSigner
+from agent_registry.model.agent_layer import normalize_layer
 import agent_registry.integration.authn  # noqa: F401 - registers the built-in authn handler
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
@@ -340,10 +345,7 @@ async def register_agent(
 ):
     """Register new agent cards. New cards are owned by the credential identity."""
     body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "agentCards must be a non-empty list")
+    registration_items = _normalize_agent_cards(body)
     registry = get_registry_dependency()
     signature_validator = get_signature_validator()
     registry_signer = get_registry_signer()
@@ -351,7 +353,7 @@ async def register_agent(
     # owner field is attribution metadata and must not redirect card ownership.
     owner = principal.identity
     return await _process_register_cards(
-        agent_cards, principal.client_ip, owner, registry,
+        registration_items, principal.client_ip, owner, registry,
         signature_validator, registry_signer, caller=principal.audit_identity())
 
 
@@ -361,18 +363,27 @@ async def list_agents(
         principal: Principal = Depends(require_roles(
             CallerRole.NMS_OSS, CallerRole.VENDOR_AGENT,
             CallerRole.PARTNER_SERVICE, CallerRole.ANALYTICS_TOOL,
-            op_name=OperationName.QUERY_AGENT)),
+        op_name=OperationName.QUERY_AGENT)),
         name: Optional[str] = Query(None, description="Exact agent name"),
         organization: Optional[str] = Query(None, description="Exact organization"),
+        layer: Optional[str] = Query(None, description="Registration layer"),
 ):
     """Query published agent cards by exact fields (all roles, read-only)."""
+    if layer is not None:
+        try:
+            layer = normalize_layer(layer)
+        except ValueError as exc:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     client_ip = principal.client_ip
-    logger.info(f"Integration query agents: name={name}, org={organization}, "
+    logger.info(f"Integration query agents: name={name}, org={organization}, layer={layer}, "
                 f"subject={principal.identity}, client={client_ip}")
     async with semaphore_guard(query_semaphore):
-        query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
-        agents = await query_handle.handle(name, organization)
         registry = get_registry_dependency()
+        if layer is None:
+            query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
+            agents = await query_handle.handle(name, organization)
+        else:
+            agents = registry.find_exact(name, organization, layer=layer)
         published_agents = []
         for agent in agents:
             agent_status = registry.get_status(agent.name, agent.provider.organization)
@@ -382,8 +393,8 @@ async def list_agents(
                 continue
             published_agents.append(MessageToDict(agent))
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
-                                {"count": len(published_agents), "name": name or '',
-                                 "organization": organization or ''})
+                                 {"count": len(published_agents), "name": name or '',
+                                  "organization": organization or '', "layer": layer or ''})
         return {"agentCards": published_agents}
 
 
@@ -435,13 +446,10 @@ async def update_agent(
         raise AuthorizationError("Vendor agents may only update their own agent cards")
 
     body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "agentCards must be a non-empty list")
+    registration_items = _normalize_agent_cards(body)
     owner_param = principal.identity if principal.role == CallerRole.VENDOR_AGENT else None
     return await _process_update_cards(
-        agent_cards, principal.client_ip, name, organization, owner_param,
+        registration_items, principal.client_ip, name, organization, owner_param,
         get_signature_validator(), get_registry_signer(),
         caller=principal.audit_identity())
 
@@ -489,6 +497,14 @@ async def semantic_query(
     """Find agents semantically relevant to a task description (LLM-backed)."""
     body = await request.json()
     task = body.get("task", '')
+    layer = body.get("layer") if "layer" in body else None
+    if layer is not None:
+        try:
+            layer = normalize_layer(layer)
+        except ValueError as exc:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    elif "layer" in body:
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "layer cannot be null")
     try:
         top_n = int(body.get("topN", 10))
     except (TypeError, ValueError):
@@ -496,13 +512,98 @@ async def semantic_query(
                                   "topN must be an integer")
     top_n = max(1, min(top_n, 50))
     async with semaphore_guard(retrieve_semaphore):
-        retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
-        agents = await retrieve_handle.handle(task, top_n)
+        if layer is None:
+            retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
+            agents = await retrieve_handle.handle(task, top_n)
+        else:
+            registry = get_registry_dependency()
+            agents = registry.retrieve_by_task(task, top_n, layer=layer)
         agents = [a for a in agents if not _is_hidden_unhealthy(a.name, a.provider.organization)]
         result = [MessageToDict(a) for a in agents]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
-                                {"task": task[:200], "count": len(result)})
+                                 {"task": task[:200], "count": len(result), "layer": layer or ''})
         return {"agentCards": result}
+
+
+_LAYER_QUERY_ROLES = (
+    CallerRole.NMS_OSS,
+    CallerRole.VENDOR_AGENT,
+    CallerRole.PARTNER_SERVICE,
+    CallerRole.ANALYTICS_TOOL,
+)
+
+
+@integration_app.get(
+    "/integration/v1/agent-registrations/{organization}/{name}",
+    summary="Get an agent registration including its layer (integration)",
+)
+async def get_agent_registration(
+        request: Request,
+        principal: Principal = Depends(require_roles(
+            *_LAYER_QUERY_ROLES, op_name=OperationName.QUERY_AGENT)),
+        name: str = Path(..., description="Agent name"),
+        organization: str = Path(..., description="Agent organization"),
+):
+    """Get a published registration record through the integration port."""
+
+    registry = get_registry_dependency()
+    record = registry.get_by_key_with_owner(name, organization)
+    if (record is None or getattr(record, "status", "published") != "published"
+            or _is_hidden_unhealthy(name, organization)):
+        await audit_integration(OperationName.QUERY_AGENT, principal, True,
+                                {"name": name, "organization": organization, "found": False})
+        raise CustomHTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
+
+    await audit_integration(OperationName.QUERY_AGENT, principal, True,
+                            {"name": name, "organization": organization, "found": True})
+    return _registration_record_to_dict(record)
+
+
+@integration_app.post(
+    "/integration/v1/agent-registrations/query",
+    summary="Query agent registrations by layer (integration)",
+)
+async def query_agent_registrations(
+        request: Request,
+        principal: Principal = Depends(require_roles(
+            *_LAYER_QUERY_ROLES, op_name=OperationName.QUERY_AGENT)),
+):
+    """Query complete registration records through the integration port."""
+
+    query = _parse_layer_query_body(await request.json())
+    registry = get_registry_dependency()
+    operation = OperationName.RETRIEVE_AGENT if query["semantic"] else OperationName.QUERY_AGENT
+
+    async with semaphore_guard(retrieve_semaphore if query["semantic"] else query_semaphore):
+        if query["semantic"]:
+            records = registry.retrieve_records_by_task(
+                query["task"], query["top_n"], layer=query["layer"],
+                status="published",
+            )
+            records = _published_healthy_records(records)
+            result = {
+                "agents": [_registration_record_to_dict(record) for record in records],
+                "count": len(records),
+            }
+        else:
+            records = registry.find_records(
+                layer=query["layer"], status="published",
+                limit=query["offset"] + query["limit"] + 1,
+            )
+            records = _published_healthy_records(records)
+            start = query["offset"]
+            page = records[start:start + query["limit"]]
+            result = {
+                "agents": [_registration_record_to_dict(record) for record in page],
+                "count": len(page),
+                "hasMore": start + len(page) < len(records),
+            }
+
+    await audit_integration(operation, principal, True,
+                            {"layer": query["layer"] or '',
+                             "task": query["task"][:200],
+                             "count": result["count"]})
+    return result
 
 
 # ---------- Audit pull API ----------

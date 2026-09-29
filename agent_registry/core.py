@@ -29,6 +29,7 @@ from google.protobuf.json_format import MessageToDict, Parse
 from loguru import logger
 
 from agent_registry.model.tag import Tag
+from agent_registry.model.agent_layer import AgentLayer, LAYER_UNSET, default_layer, normalize_layer
 from agent_registry.config import PERSISTENCE_FILE, PERSISTENCE_METADATA_FILE, USE_VECTORDB, COLLECTION_NAME, \
     PERSISTENCE_CONF, PERSISTENCE_MODE
 from agent_registry.persistence import StorageRegistry, StorageBackend
@@ -105,18 +106,28 @@ class RegistryCore:
         """Create a normalized key for indexing."""
         return make_agent_key(name, organization)
 
-    def register(self, agent: AgentCard, use_vectordb: bool = USE_VECTORDB, owner: Optional[str] = None) -> bool:
+    def register(self, agent: AgentCard, use_vectordb: Optional[bool] = None,
+                 owner: Optional[str] = None,
+                 layer=LAYER_UNSET) -> bool:
         """
         Register a new agent. Returns True if successful, False if duplicate.
         Raises ValueError if agent lacks required fields (name, provider.organization).
         """
-        return self.register_with_status(agent, initial_status='published', use_vectordb=use_vectordb, owner=owner)
+        return self.register_with_status(
+            agent, initial_status='published', use_vectordb=use_vectordb,
+            owner=owner, layer=layer
+        )
 
     def register_with_status(self, agent: AgentCard, initial_status: str = 'published',
-                             use_vectordb: bool = USE_VECTORDB, owner: Optional[str] = None) -> bool:
+                             use_vectordb: Optional[bool] = None,
+                             owner: Optional[str] = None,
+                             layer=LAYER_UNSET) -> bool:
         """
         Register a new agent with specified initial status.
         """
+        effective_layer = default_layer(layer)
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         with self._lock:
             if use_vectordb:
                 entity_str = json.dumps(MessageToDict(agent, preserving_proto_field_name=True))
@@ -124,26 +135,45 @@ class RegistryCore:
                 id = self._make_id(agent.name, agent.provider.organization)
                 insert_entity = {"embedding": embedding, "id": id, "name": agent.name,
                                  "description": agent.description,
-                                 "organization": agent.provider.organization,
-                                 "agent_card": entity_str, "status": initial_status, "owner": owner}
+                                  "organization": agent.provider.organization,
+                                  "agent_card": entity_str, "status": initial_status,
+                                  "owner": owner, "layer": effective_layer}
                 insert_data = {"collection_name": COLLECTION_NAME, "entity": insert_entity}
                 result = self.vectordb.insert_entity(insert_data)
             else:
-                result = self.storage.create(agent, owner=owner, status=initial_status)
+                if layer is LAYER_UNSET:
+                    result = self.storage.create(
+                        agent, owner=owner, status=initial_status
+                    )
+                else:
+                    result = self.storage.create(
+                        agent, owner=owner, status=initial_status, layer=effective_layer
+                    )
                 if result:
                     logger.info(
                         f"Registered agent: {agent.name} (org={agent.provider.organization}, status={initial_status}, owner={owner})")
             if result:
                 self._publish_event(EventType.AGENT_REGISTERED, agent.name, agent.provider.organization,
-                                    card_data=MessageToDict(agent, preserving_proto_field_name=True))
+                                    card_data=MessageToDict(agent, preserving_proto_field_name=True),
+                                    layer=effective_layer)
             return result
 
     def find_exact(self, name: Optional[str] = None, organization: Optional[str] = None,
-                   use_vectordb: bool = USE_VECTORDB) -> List[AgentCard]:
+                   use_vectordb: Optional[bool] = None,
+                   layer: Optional[str] = None) -> List[AgentCard]:
         """
         Exact search based on name, organization.
         All parameters are optional; if multiple are given, they are combined with AND.
         """
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
+
+        if layer is not None:
+            return [record.agent_card for record in self.find_records(
+                name=name, organization=organization, layer=layer,
+                use_vectordb=use_vectordb
+            )]
+
         if use_vectordb:
             if name is not None and organization is not None:
                 query_data = {"collection_name": COLLECTION_NAME, "key": "id",
@@ -170,7 +200,87 @@ class RegistryCore:
                 return self.storage.find_by_organization(organization)
             return self.storage.find_all()
 
-    def get_agents(self, use_vectordb: bool = USE_VECTORDB):
+    def find_records(self, name: Optional[str] = None,
+                     organization: Optional[str] = None,
+                     layer: Optional[str] = None,
+                     status: Optional[str] = None,
+                     use_vectordb: Optional[bool] = None,
+                     limit: Optional[int] = None,
+                     offset: int = 0) -> List[AgentRecord]:
+        """Find complete registration records, including registry metadata."""
+
+        if layer is not None:
+            layer = normalize_layer(layer)
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
+
+        if use_vectordb:
+            if hasattr(self.vectordb, "find_records"):
+                query = {
+                    "collection_name": COLLECTION_NAME,
+                    "name": name,
+                    "organization": organization,
+                    "layer": layer,
+                    "status": status,
+                }
+                if limit is not None:
+                    query.update(limit=limit, offset=offset)
+                records = self.vectordb.find_records(
+                    **query,
+                )
+                return sorted(records, key=self._registration_record_sort_key)
+            # Compatibility fallback for third-party vector clients that have
+            # not added registration metadata support yet.
+            entities = self.vectordb.get_all_entities({"collection_name": COLLECTION_NAME})
+            records = []
+            for data in entities:
+                card_data = data.get("agent_card", data)
+                if isinstance(card_data, str):
+                    card = Parse(card_data, AgentCard())
+                else:
+                    card = AgentCard(**card_data)
+                if name is not None and name.lower() not in card.name.lower():
+                    continue
+                if organization is not None and organization != card.provider.organization:
+                    continue
+                raw_layer = data.get("layer", AgentLayer.UNKNOWN.value)
+                try:
+                    stored_layer = normalize_layer(raw_layer)
+                except ValueError:
+                    stored_layer = AgentLayer.UNKNOWN.value
+                if layer is not None and stored_layer != layer:
+                    continue
+                if status is not None and data.get("status", 'published') != status:
+                    continue
+                records.append(AgentRecord(
+                    agent_card=card,
+                    owner=data.get("owner"),
+                    status=data.get("status", 'published'),
+                    layer=stored_layer,
+                ))
+            return sorted(records, key=self._registration_record_sort_key)
+
+        records = self.storage.find_records(
+            name=name, organization=organization, layer=layer, status=status
+        ) if self.storage else []
+        return sorted(records, key=self._registration_record_sort_key)
+
+    @staticmethod
+    def _registration_record_sort_key(record: AgentRecord) -> tuple:
+        """Keep ordinary registration queries stable across storage backends."""
+
+        card = record.agent_card
+        owner = getattr(record, "owner", None)
+        return (
+            card.provider.organization,
+            card.name,
+            owner is None,
+            owner or "",
+        )
+
+    def get_agents(self, use_vectordb: Optional[bool] = None):
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         if use_vectordb:
             entities = self.vectordb.get_all_entities({"collection_name": COLLECTION_NAME})
             result = {}
@@ -187,38 +297,71 @@ class RegistryCore:
             return result
 
     def update(self, name: str, organization: str, agent_data: Dict[str, Any],
-               use_vectordb: bool = USE_VECTORDB, owner: Optional[str] = None) -> bool:
+               use_vectordb: Optional[bool] = None,
+               owner: Optional[str] = None,
+               layer=LAYER_UNSET) -> bool:
         """
         Update an existing agent. The primary key (name, organization) cannot be changed.
         Owner permission must be verified by the caller before invoking.
         Return True if successful, False if not found.
         """
+        if layer is not LAYER_UNSET:
+            layer = normalize_layer(layer)
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         with self._lock:
             if use_vectordb:
+                existing = self.get_by_key_with_owner(
+                    name, organization, owner=owner, use_vectordb=True
+                )
+                if layer is LAYER_UNSET:
+                    layer = existing.layer if existing else AgentLayer.UNKNOWN.value
                 entity_str = json.dumps(agent_data)
                 embedding = self.embedding_tool.embed(agent_data["description"])
                 key = self._make_id(agent_data["name"], agent_data["provider"]["organization"])
+                stored_owner = owner if owner is not None else (existing.owner if existing else None)
+                stored_status = existing.status if existing else "published"
                 insert_entity = {"id": key, "embedding": embedding, "name": agent_data["name"],
                                  "description": agent_data["description"],
-                                 "organization": agent_data["provider"]["organization"], "agent_card": entity_str,
-                                 "owner": owner}
+                                  "organization": agent_data["provider"]["organization"], "agent_card": entity_str,
+                                  "owner": stored_owner, "status": stored_status,
+                                  "layer": layer}
                 update_data = {"collection_name": COLLECTION_NAME, "entity": insert_entity}
                 result = self.vectordb.update_entity(update_data)
                 logger.info(f"Updated agent in vectordb: {name}({organization}, owner={owner})")
+                if result:
+                    self._publish_event(
+                        EventType.AGENT_UPDATED, name, organization,
+                        card_data=agent_data, layer=layer,
+                    )
                 return result
             else:
-                result = self.storage.update(name, organization, agent_data, owner=owner)
+                if layer is LAYER_UNSET:
+                    result = self.storage.update(
+                        name, organization, agent_data, owner=owner
+                    )
+                else:
+                    result = self.storage.update(
+                        name, organization, agent_data, owner=owner, layer=layer
+                    )
                 logger.info(f"Updated agent: {name}({organization}, owner={owner})")
             if result:
-                self._publish_event(EventType.AGENT_UPDATED, name, organization, card_data=agent_data)
+                record = self.storage.find_by_key(name, organization) if self.storage else None
+                self._publish_event(EventType.AGENT_UPDATED, name, organization,
+                                    card_data=agent_data,
+                                    layer=record.layer if record else (
+                                        None if layer is LAYER_UNSET else layer
+                                    ))
             return result
 
-    def deregister(self, name: str, organization: str, use_vectordb: bool = USE_VECTORDB,
+    def deregister(self, name: str, organization: str, use_vectordb: Optional[bool] = None,
                    owner: Optional[str] = None) -> bool:
         """
         Remove an agent. Returns True if deleted, False if not found.
         Owner permission must be verified by the caller before invoking.
         """
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         with self._lock:
             if use_vectordb:
                 delete_data = {"collection_name": COLLECTION_NAME, "id": self._make_id(name, organization)}
@@ -278,7 +421,9 @@ class RegistryCore:
                 })
         return result
 
-    def retrieve_by_task(self, task: str, top_n: int, use_vectordb: bool = USE_VECTORDB) -> List[AgentCard]:
+    def retrieve_by_task(self, task: str, top_n: int,
+                         use_vectordb: Optional[bool] = None,
+                         layer: Optional[str] = None) -> List[AgentCard]:
         """
         Fuzzy retrieve using LLM to match task description with agent capabilities.
         Returns a list of candidate agents(could be empty).
@@ -286,17 +431,25 @@ class RegistryCore:
         if not task:
             return []
 
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
+
         if use_vectordb:
             retrieve_entity = {"collection_name": COLLECTION_NAME,
                                "embedding": self.embedding_tool.embed(task),
                                "top_n": top_n}
+            if layer is not None:
+                retrieve_entity["layer"] = normalize_layer(layer)
             retrieve_results = self.vectordb.retrieve_entity(retrieve_entity)
             agents_info = self._build_agents_info(retrieve_results)
             selected_pairs = self._select_agents_by_llm(task, agents_info, top_n)
             result = [agent for agent in retrieve_results
                       if (agent.get("organization", ""), agent["name"]) in selected_pairs]
         else:
-            agents = self.storage.find_all()
+            if layer is not None:
+                agents = [record.agent_card for record in self.storage.find_records(layer=layer)]
+            else:
+                agents = self.storage.find_all()
             if not agents:
                 return []
             agents_info = self._build_agents_info(agents)
@@ -307,15 +460,53 @@ class RegistryCore:
         logger.info(f"LLM selected {len(result)} agents for task: {task}")
         return result
 
-    def get_by_key(self, name: str, organization: str, use_vectordb: bool = USE_VECTORDB) -> Optional[AgentCard]:
+    def retrieve_records_by_task(self, task: str, top_n: int,
+                                 layer: Optional[str] = None,
+                                 status: Optional[str] = None,
+                                 use_vectordb: Optional[bool] = None) -> List[AgentRecord]:
+        """Run semantic retrieval while retaining registration metadata."""
+
+        if not task:
+            return []
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
+
+        if use_vectordb and hasattr(self.vectordb, "retrieve_records"):
+            return self.vectordb.retrieve_records(
+                collection_name=COLLECTION_NAME,
+                embedding=self.embedding_tool.embed(task),
+                top_n=top_n,
+                layer=normalize_layer(layer) if layer is not None else None,
+                status=status,
+                selector=self._select_agents_by_llm,
+                task=task,
+            )
+
+        records = self.find_records(
+            layer=layer, status=status, use_vectordb=use_vectordb
+        )
+        if not records:
+            return []
+        agents_info = self._build_agents_info([record.agent_card for record in records])
+        selected_pairs = self._select_agents_by_llm(task, agents_info, top_n)
+        return [record for record in records
+                if (record.agent_card.provider.organization, record.agent_card.name)
+                in selected_pairs]
+
+    def get_by_key(self, name: str, organization: str,
+                   use_vectordb: Optional[bool] = None) -> Optional[AgentCard]:
         """Search a single agent by exact name and organization."""
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         if use_vectordb:
             query_data = {"collection_name": COLLECTION_NAME, "key": "id", "value": self._make_id(name, organization)}
             result = self.vectordb.query_by_key(query_data)
             if len(result) > 0:
                 agent_data = result[0]
-                agent_card_json = agent_data.get("agent_card", "{}")
-                return Parse(agent_card_json, AgentCard())
+                agent_card_json = agent_data.get("agent_card") if isinstance(agent_data, dict) else None
+                if agent_card_json is not None:
+                    return Parse(agent_card_json, AgentCard())
+                return Parse(json.dumps(agent_data), AgentCard())
             else:
                 return None
         else:
@@ -323,34 +514,60 @@ class RegistryCore:
             return record.agent_card if record else None
 
     def get_by_key_with_owner(self, name: str, organization: str, owner: Optional[str] = None,
-                              use_vectordb: bool = USE_VECTORDB) -> Optional[AgentRecord]:
+                              use_vectordb: Optional[bool] = None) -> Optional[AgentRecord]:
         """Search a single agent by exact name and organization, returns AgentRecord with owner."""
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         if use_vectordb:
+            if hasattr(self.vectordb, "find_records_by_key"):
+                records = self.vectordb.find_records_by_key(
+                    COLLECTION_NAME, name, organization
+                )
+                if records:
+                    record = records[0]
+                    if owner is None or record.owner in (None, '', owner):
+                        return record
+                    return None
             query_data = {"collection_name": COLLECTION_NAME, "key": "id", "value": self._make_id(name, organization)}
             result = self.vectordb.query_by_key(query_data)
             if len(result) > 0:
                 agent_data = result[0]
+                card_data = agent_data.get("agent_card", agent_data)
+                if isinstance(card_data, str):
+                    card = Parse(card_data, AgentCard())
+                else:
+                    card = Parse(json.dumps(card_data), AgentCard())
                 stored_owner = agent_data.get("owner")
-                agent_card_json = agent_data.get("agent_card", "{}")
+                if owner is not None and stored_owner not in (None, '', owner):
+                    return None
+                raw_layer = agent_data.get("layer", AgentLayer.UNKNOWN.value)
+                try:
+                    stored_layer = normalize_layer(raw_layer)
+                except ValueError:
+                    stored_layer = AgentLayer.UNKNOWN.value
                 return AgentRecord(
-                    agent_card=Parse(agent_card_json, AgentCard()),
-                    owner=stored_owner
+                    agent_card=card,
+                    owner=stored_owner,
+                    status=agent_data.get("status", "published"),
+                    layer=stored_layer,
                 )
             else:
                 return None
         else:
             return self.storage.find_by_key(name, organization, owner=owner)
 
-    def find_by_owner(self, owner: str, use_vectordb: bool = USE_VECTORDB) -> List[AgentRecord]:
+    def find_by_owner(self, owner: str, use_vectordb: Optional[bool] = None) -> List[AgentRecord]:
         """Find all agents belonging to a specific owner."""
+        if use_vectordb is None:
+            use_vectordb = self.use_vectordb
         if use_vectordb:
+            if hasattr(self.vectordb, "find_records"):
+                return self.vectordb.find_records(
+                    collection_name=COLLECTION_NAME, owner=owner, status=None
+                )
             query_data = {"collection_name": COLLECTION_NAME, "key": "owner", "value": owner}
             results = self.vectordb.query_by_key(query_data)
-            records = []
-            for r in results:
-                agent_card_json = r.get("agent_card", "{}")
-                records.append(AgentRecord(agent_card=Parse(agent_card_json, AgentCard()), owner=r.get("owner")))
-            return records
+            return [AgentRecord(agent_card=Parse(json.dumps(r), AgentCard())) for r in results]
         else:
             return self.storage.find_by_owner(owner)
 
@@ -358,7 +575,8 @@ class RegistryCore:
         return make_agent_id(name, organization)
 
     def _publish_event(self, event_type: EventType, name: str, organization: str,
-                       card_data: Optional[Dict[str, Any]] = None) -> None:
+                       card_data: Optional[Dict[str, Any]] = None,
+                       layer: Optional[str] = None) -> None:
         """Publish a registry change event. Event failures never break mutations."""
         try:
             data = {
@@ -368,6 +586,8 @@ class RegistryCore:
             }
             if card_data is not None:
                 data["agent_card"] = card_data
+            if layer is not None:
+                data["layer"] = layer
             get_event_bus().publish(event_type, data)
         except Exception as e:
             logger.error(f"Failed to publish registry event {event_type}: {e}")
@@ -389,22 +609,27 @@ class RegistryCore:
 
     def get_status(self, name: str, organization: str) -> Optional[str]:
         """Get agent status from status map, or None if not found."""
+        if self.use_vectordb:
+            record = self.get_by_key_with_owner(name, organization, use_vectordb=True)
+            return record.status if record else None
         if not self.storage:
             return None
         record = self.storage.find_by_key(name, organization)
         return record.status if record else None
 
     def get_metadata(self, name: str, organization: str) -> Dict[str, Any]:
-        """Get agent metadata (agent_name, organization, status, tag)."""
+        """Get agent metadata (agent_name, organization, status, tag, layer)."""
         status = self.get_status(name, organization) or 'published'
         tags = self.get_agent_tags(name, organization) or []
         created_at = self.get_created_at(name, organization) or ''
         updated_at = self.get_updated_at(name, organization) or ''
+        record = self.get_by_key_with_owner(name, organization)
         metadata = {
             "agent_name": name,
             "organization": organization,
             "status": status,
             "tag": tags,
+            "layer": default_layer(getattr(record, "layer", AgentLayer.UNKNOWN.value)),
             "created_at": created_at,
             "updated_at": updated_at
         }
@@ -436,7 +661,11 @@ class RegistryCore:
             if result:
                 record = self.storage.find_by_key(name, organization)
                 card_data = MessageToDict(record.agent_card, preserving_proto_field_name=True) if record else None
-                self._publish_event(EventType.AGENT_UPDATED, name, organization, card_data=card_data)
+                self._publish_event(
+                    EventType.AGENT_UPDATED, name, organization,
+                    card_data=card_data,
+                    layer=record.layer if record else None,
+                )
             return result
 
     def get_agents_by_status(self, status: str) -> List[AgentCard]:

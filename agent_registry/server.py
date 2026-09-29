@@ -63,6 +63,14 @@ from agent_registry.broadcast.subscriptions import Subscription
 from agent_registry.health import get_health_service, initialize_health_service
 from agent_registry.health.state import HealthStatus
 from agent_registry.model.validated_agentcard import validate_agent_card
+from agent_registry.model.agent_layer import (
+    AgentLayer,
+    LAYER_UNSET,
+    default_layer,
+    normalize_layer,
+    normalize_registration_item,
+    RegistrationItem,
+)
 from agent_registry.registry_instance import get_registry, initialize_registry
 from agent_registry.middleware import ConnectionLimitMiddleware, TimeoutMiddleware
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
@@ -518,6 +526,110 @@ async def _check_duplicate_agent(agent: AgentCard, registry: RegistryCore, clien
                                   f"Registration skipped: duplicate agent ({agent.name}, {agent.provider.organization})")
 
 
+def _normalize_agent_cards(body: dict) -> list[RegistrationItem]:
+    """Normalize legacy and layer-aware request entries."""
+
+    raw_items = body.get("agentCards", []) if isinstance(body, dict) else []
+    if not raw_items:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "agentCards must be a non-empty list",
+        )
+    if not isinstance(raw_items, list):
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "agentCards must be a list",
+        )
+    try:
+        return [normalize_registration_item(item) for item in raw_items]
+    except ValueError as exc:
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+
+
+def _registration_record_to_dict(record) -> dict:
+    """Serialize a complete registration record without changing AgentCard."""
+
+    return {
+        "agentCard": MessageToDict(record.agent_card),
+        "layer": default_layer(getattr(record, "layer", AgentLayer.UNKNOWN.value)),
+    }
+
+
+def _parse_layer_query_body(body: Any) -> dict:
+    """Validate the unified layer-aware query request."""
+
+    if not isinstance(body, dict):
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "request body must be an object")
+
+    if "layer" in body:
+        if body["layer"] is None:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "layer cannot be null")
+        try:
+            layer = normalize_layer(body["layer"])
+        except ValueError as exc:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    else:
+        layer = None
+
+    if "task" in body and body["task"] is None:
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "task cannot be null")
+    task = body.get("task", "")
+    if not isinstance(task, str):
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "task must be a string")
+
+    semantic = bool(task.strip())
+
+    def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
+        value = body.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                       f"{name} must be an integer")
+        if value < minimum or value > maximum:
+            raise CustomHTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"{name} must be between {minimum} and {maximum}",
+            )
+        return value
+
+    if semantic:
+        if "limit" in body or "offset" in body:
+            raise CustomHTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "limit and offset are only valid for ordinary queries",
+            )
+        top_n = _integer("topN", 10, 1, 50)
+        return {"layer": layer, "task": task, "top_n": top_n, "semantic": True}
+
+    if "topN" in body:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "topN is only valid for semantic queries",
+        )
+    limit = _integer("limit", 100, 1, 1000)
+    offset = _integer("offset", 0, 0, 2**31 - 1)
+    return {
+        "layer": layer,
+        "task": task,
+        "limit": limit,
+        "offset": offset,
+        "semantic": False,
+    }
+
+
+def _published_healthy_records(records: list) -> list:
+    """Apply the same publication and health visibility rules as old queries."""
+
+    result = []
+    for record in records:
+        if getattr(record, "status", "published") != "published":
+            continue
+        card = record.agent_card
+        if _is_hidden_unhealthy(card.name, card.provider.organization):
+            continue
+        result.append(record)
+    return result
+
+
 def _is_hidden_unhealthy(name: str, organization: str) -> bool:
     """When heartbeat detection hides unhealthy agents, suspect/offline vanish from queries."""
     try:
@@ -554,12 +666,16 @@ async def _perform_registration(
         details: dict,
         initial_status: str = 'published',
         owner: Optional[str] = None,
+        layer=LAYER_UNSET,
         caller: str = '',
 ) -> bool:
     """Execute the actual registration, handle ValueError and other exceptions, log accordingly."""
     try:
         save_handle = HandlerRegistry.get_handler(InterfaceType.INSERT)
-        success = await save_handle.handle(agent, initial_status=initial_status, owner=owner)
+        kwargs = {"initial_status": initial_status, "owner": owner}
+        if layer is not LAYER_UNSET:
+            kwargs["layer"] = layer
+        success = await save_handle.handle(agent, **kwargs)
         return success
     except ValueError as e:
         details["message"] = str(e)
@@ -580,12 +696,16 @@ async def _perform_update(
         data: dict,
         details: dict,
         owner: Optional[str] = None,
+        layer=LAYER_UNSET,
         caller: str = '',
 ) -> bool:
     """Execute the actual update, handle ValueError and other exceptions, log accordingly."""
     try:
         update_handle = HandlerRegistry.get_handler(InterfaceType.UPDATE)
-        success = await update_handle.handle(name, organization, data, owner=owner)
+        kwargs = {"owner": owner}
+        if layer is not LAYER_UNSET:
+            kwargs["layer"] = layer
+        success = await update_handle.handle(name, organization, data, **kwargs)
         if success:
             await _audit_result(OperationName.UPDATE_AGENT, True, details, client_ip, caller)
         return success
@@ -623,11 +743,8 @@ async def register_agent(
     cards already registered by this request (partial success visibility).
     """
     body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "agentCards must be a non-empty list")
+    registration_items = _normalize_agent_cards(body)
     client_ip = request.client.host
-    total_cards = len(agent_cards)
 
     owner = _get_owner_from_request(request) if OWNER_ISOLATION_ENABLED else None
 
@@ -635,20 +752,20 @@ async def register_agent(
     await authenticate_handle.handle(client_ip, request)
 
     return await _process_register_cards(
-        agent_cards, client_ip, owner, registry, signature_validator, registry_signer,
+        registration_items, client_ip, owner, registry, signature_validator, registry_signer,
         caller=_verified_caller(owner))
 
 
 async def _process_register_cards(
-        agent_cards: list, client_ip: str, owner: Optional[str],
+        registration_items: list[RegistrationItem], client_ip: str, owner: Optional[str],
         registry: RegistryCore, signature_validator: AgentCardSignatureValidator,
         registry_signer: Optional[AgentCardSigner], caller: str = ''):
     """Shared registration flow (main port and integration port): validate, sign, register each card."""
-    total_cards = len(agent_cards)
+    total_cards = len(registration_items)
     registered_results = []
     async with semaphore_guard(register_semaphore):
-        for index, agent_card in enumerate(agent_cards, start=1):
-            agent = Parse(json.dumps(agent_card), AgentCard())
+        for index, registration_item in enumerate(registration_items, start=1):
+            agent = Parse(json.dumps(registration_item.agent_card), AgentCard())
             card_started = time.perf_counter()
             logger.info(
                 f"Register agent request: card={index}/{total_cards}, name={agent.name}, org={agent.provider.organization}, client={client_ip}, owner={owner}")
@@ -656,6 +773,7 @@ async def _process_register_cards(
                 "agentName": agent.name,
                 "organization": agent.provider.organization,
                 "url": agent.provider.url,
+                "layer": default_layer(registration_item.layer),
             }
             try:
                 await _check_agent_limit(registry, client_ip, details, caller)
@@ -686,7 +804,10 @@ async def _process_register_cards(
                 approval_enabled = config.get('agent_approval_enabled', 'false')
                 initial_status = 'registered' if approval_enabled == 'true' else 'published'
 
-                result = await _perform_registration(agent, client_ip, details, initial_status=initial_status, owner=owner, caller=caller)
+                result = await _perform_registration(
+                    agent, client_ip, details, initial_status=initial_status,
+                    owner=owner, layer=registration_item.layer, caller=caller
+                )
                 if not result:
                     raise CustomHTTPException(
                         status.HTTP_409_CONFLICT,
@@ -697,12 +818,15 @@ async def _process_register_cards(
                 duration_ms = int((time.perf_counter() - card_started) * 1000)
                 logger.info(
                     f"Register agent success: card={index}/{total_cards}, name={agent.name}, org={agent.provider.organization}, status={initial_status}, registrySigned={registry_signed}, duration={duration_ms}ms")
-                registered_results.append({
+                result_item = {
                     "name": agent.name,
                     "organization": agent.provider.organization,
                     "status": initial_status,
                     "registrySigned": registry_signed,
-                })
+                }
+                if registration_item.wrapped:
+                    result_item["layer"] = default_layer(registration_item.layer)
+                registered_results.append(result_item)
             except CustomHTTPException as e:
                 logger.error(
                     f"Register batch aborted at card {index}/{total_cards}: name={agent.name}, org={agent.provider.organization}, httpStatus={e.status_code}, detail={e.detail}")
@@ -722,6 +846,7 @@ async def list_agents_exact(
         request: Request,
         name: Optional[str] = Query(None, description="Exact agent name"),
         organization: Optional[str] = Query(None, description="Exact organization"),
+        layer: Optional[str] = Query(None, description="Registration layer"),
         registry: RegistryCore = Depends(get_registry),
         _: Any = Depends(RateLimiter('query')),
 ):
@@ -731,16 +856,24 @@ async def list_agents_exact(
     Only returns agents with published status, response does not include status field.
     """
     client_ip = request.client.host
-    logger.info(f"Query agents request: name={name}, org={organization}, client={client_ip}")
+    if layer is not None:
+        try:
+            layer = normalize_layer(layer)
+        except ValueError as exc:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    logger.info(f"Query agents request: name={name}, org={organization}, layer={layer}, client={client_ip}")
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)
     await _maybe_audit_read(OperationName.QUERY_AGENT,
-                            {"name": name or '', "organization": organization or ''},
+                            {"name": name or '', "organization": organization or '', "layer": layer or ''},
                             client_ip, caller=_verified_caller(_get_owner_from_request(request)))
 
     async with semaphore_guard(query_semaphore):
-        query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
-        agents = await query_handle.handle(name, organization)
+        if layer is None:
+            query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
+            agents = await query_handle.handle(name, organization)
+        else:
+            agents = registry.find_exact(name, organization, layer=layer)
 
         published_agents = []
         for agent in agents:
@@ -771,11 +904,8 @@ async def update_agent(
     Returns 404 if the agent does not exist.
     """
     body_json = await request.json()
-    agent_cards = body_json.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "agentCards must be a non-empty list")
+    registration_items = _normalize_agent_cards(body_json)
     client_ip = request.client.host
-    total_cards = len(agent_cards)
 
     owner = await _verify_owner_permission(request, name, organization, registry) if OWNER_ISOLATION_ENABLED else None
 
@@ -783,20 +913,20 @@ async def update_agent(
     await authenticate_handle.handle(client_ip, request)
 
     return await _process_update_cards(
-        agent_cards, client_ip, name, organization, owner, signature_validator, registry_signer,
+        registration_items, client_ip, name, organization, owner, signature_validator, registry_signer,
         caller=_verified_caller(owner))
 
 
 async def _process_update_cards(
-        agent_cards: list, client_ip: str, name: str, organization: str, owner: Optional[str],
+        registration_items: list[RegistrationItem], client_ip: str, name: str, organization: str, owner: Optional[str],
         signature_validator: AgentCardSignatureValidator, registry_signer: Optional[AgentCardSigner],
         caller: str = ''):
     """Shared update flow (main port and integration port): validate, sign, update each card."""
-    total_cards = len(agent_cards)
+    total_cards = len(registration_items)
     updated_results = []
     async with semaphore_guard(update_semaphore):
-        for index, agent_card in enumerate(agent_cards, start=1):
-            agent_data = Parse(json.dumps(agent_card), AgentCard())
+        for index, registration_item in enumerate(registration_items, start=1):
+            agent_data = Parse(json.dumps(registration_item.agent_card), AgentCard())
             card_started = time.perf_counter()
             logger.info(f"Update agent request: card={index}/{total_cards}, name={name}, org={organization}, client={client_ip}, owner={owner}")
             details = {
@@ -804,6 +934,8 @@ async def _process_update_cards(
                 "organization": agent_data.provider.organization,
                 "url": agent_data.provider.url,
             }
+            if registration_item.layer is not LAYER_UNSET:
+                details["layer"] = registration_item.layer
             try:
                 try:
                     validate_agent_card(agent_data)
@@ -829,18 +961,24 @@ async def _process_update_cards(
                     logger.info(f"Registry signature added for agent: card={index}/{total_cards}, name={agent_data.name}")
 
                 data = MessageToDict(agent_data, preserving_proto_field_name=True)
-                success = await _perform_update(client_ip, name, organization, data, details, owner=owner, caller=caller)
+                success = await _perform_update(
+                    client_ip, name, organization, data, details, owner=owner,
+                    layer=registration_item.layer, caller=caller
+                )
                 if not success:
                     raise CustomHTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
 
                 duration_ms = int((time.perf_counter() - card_started) * 1000)
                 logger.info(
                     f"Update agent success: card={index}/{total_cards}, name={name}, org={organization}, registrySigned={registry_signed}, duration={duration_ms}ms")
-                updated_results.append({
+                result_item = {
                     "name": name,
                     "organization": organization,
                     "registrySigned": registry_signed,
-                })
+                }
+                if registration_item.wrapped and registration_item.layer is not LAYER_UNSET:
+                    result_item["layer"] = default_layer(registration_item.layer)
+                updated_results.append(result_item)
             except CustomHTTPException as e:
                 logger.error(
                     f"Update batch aborted at card {index}/{total_cards}: name={name}, org={organization}, httpStatus={e.status_code}, detail={e.detail}")
@@ -890,6 +1028,7 @@ async def deregister_agent(
 async def retrieve_agents_by_task(
         request: Request,
         top_n: int = 10,
+        registry: RegistryCore = Depends(get_registry),
         _: Any = Depends(RateLimiter('retrieve'))
 ):
     """
@@ -897,17 +1036,28 @@ async def retrieve_agents_by_task(
     """
     body_json = await request.json()
     task = body_json.get("task")
+    layer = body_json.get("layer") if "layer" in body_json else None
+    if layer is not None:
+        try:
+            layer = normalize_layer(layer)
+        except ValueError as exc:
+            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    elif "layer" in body_json:
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "layer cannot be null")
     client_ip = request.client.host
-    logger.info(f"Retrieve agents request: task='{task}', top_n={top_n}, client={client_ip}")
+    logger.info(f"Retrieve agents request: task='{task}', layer={layer}, top_n={top_n}, client={client_ip}")
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)
     await _maybe_audit_read(OperationName.RETRIEVE_AGENT,
-                            {"task": str(task)[:200]},
+                            {"task": str(task)[:200], "layer": layer or ''},
                             client_ip, caller=_verified_caller(_get_owner_from_request(request)))
 
     async with semaphore_guard(retrieve_semaphore):
-        retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
-        agents = await retrieve_handle.handle(task, top_n)
+        if layer is None:
+            retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
+            agents = await retrieve_handle.handle(task, top_n)
+        else:
+            agents = registry.retrieve_by_task(task, top_n, layer=layer)
         agents = [agent for agent in agents
                   if not _is_hidden_unhealthy(agent.name, agent.provider.organization)]
         result = [MessageToDict(agent) for agent in agents]
@@ -952,6 +1102,87 @@ async def get_agent(
         agent_dict = MessageToDict(record.agent_card)
         logger.info(f"Get agent result: {'found' if agent_dict else 'not found'} for name={name}, org={organization}")
         return {"agentCards": [agent_dict]}
+
+
+@app.get(
+    "/rest/v1/registry-center/agent-registrations/{organization}/{name}",
+    response_model=None,
+    summary="Get an agent registration including its layer",
+)
+async def get_agent_registration(
+        request: Request,
+        name: str = Path(..., description="Agent name"),
+        organization: str = Path(..., description="Agent organization"),
+        registry: RegistryCore = Depends(get_registry),
+        _: Any = Depends(RateLimiter('get')),
+):
+    """Return the published registration metadata for one agent."""
+
+    client_ip = request.client.host
+    authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
+    await authenticate_handle.handle(client_ip, request)
+    await _maybe_audit_read(
+        OperationName.GET_AGENT,
+        {"name": name, "organization": organization},
+        client_ip,
+        caller=_verified_caller(_get_owner_from_request(request)),
+    )
+
+    async with semaphore_guard(get_semaphore):
+        record = registry.get_by_key_with_owner(name, organization)
+        if (record is None or getattr(record, "status", "published") != "published"
+                or _is_hidden_unhealthy(name, organization)):
+            raise CustomHTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
+        return _registration_record_to_dict(record)
+
+
+@app.post(
+    "/rest/v1/registry-center/agent-registrations/query",
+    response_model=None,
+    summary="Query agent registrations by layer",
+)
+async def query_agent_registrations(
+        request: Request,
+        registry: RegistryCore = Depends(get_registry),
+        _: Any = Depends(RateLimiter('query')),
+):
+    """Query complete registration records for orchestration callers."""
+
+    query = _parse_layer_query_body(await request.json())
+    client_ip = request.client.host
+    authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
+    await authenticate_handle.handle(client_ip, request)
+    await _maybe_audit_read(
+        OperationName.RETRIEVE_AGENT if query["semantic"] else OperationName.QUERY_AGENT,
+        {"layer": query["layer"] or '', "task": query["task"][:200]},
+        client_ip,
+        caller=_verified_caller(_get_owner_from_request(request)),
+    )
+
+    async with semaphore_guard(retrieve_semaphore if query["semantic"] else query_semaphore):
+        if query["semantic"]:
+            records = registry.retrieve_records_by_task(
+                query["task"], query["top_n"], layer=query["layer"],
+                status="published",
+            )
+            records = _published_healthy_records(records)
+            return {
+                "agents": [_registration_record_to_dict(record) for record in records],
+                "count": len(records),
+            }
+
+        records = registry.find_records(
+            layer=query["layer"], status="published",
+            limit=query["offset"] + query["limit"] + 1,
+        )
+        records = _published_healthy_records(records)
+        start = query["offset"]
+        page = records[start:start + query["limit"]]
+        return {
+            "agents": [_registration_record_to_dict(record) for record in page],
+            "count": len(page),
+            "hasMore": start + len(page) < len(records),
+        }
 
 
 def close_registry():

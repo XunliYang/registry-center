@@ -52,10 +52,18 @@ class SQLiteStorage(SqlStorageBackend):
         try:
             cur = conn.cursor()
             cur.execute(SQLiteQueries.CREATE_TABLE.value)
+            cur.execute("PRAGMA table_info(agent_card)")
+            columns = {row[1] for row in cur.fetchall()}
+            if "layer" not in columns:
+                cur.execute(
+                    "ALTER TABLE agent_card ADD COLUMN layer TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            cur.execute(SQLiteQueries.NORMALIZE_LAYER.value)
             cur.execute(SQLiteQueries.CREATE_INDEX_ORG.value)
             cur.execute(SQLiteQueries.CREATE_INDEX_NAME.value)
             cur.execute(SQLiteQueries.CREATE_INDEX_STATUS.value)
             cur.execute(SQLiteQueries.CREATE_INDEX_OWNER.value)
+            cur.execute(SQLiteQueries.CREATE_INDEX_LAYER.value)
             cur.execute(SQLiteQueries.CREATE_TAG_TABLE.value)
             cur.execute(SQLiteQueries.CREATE_TAG_INDEX_NAME.value)
             conn.commit()

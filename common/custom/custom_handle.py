@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Type
 
 from agent_registry.registry_instance import get_registry
+from agent_registry.model.agent_layer import LAYER_UNSET
 from common.custom.interface_type import InterfaceType
 from common.log.audit_logger import audit_logger
 from common.util.authenticate_util import authenticate
@@ -55,17 +56,27 @@ class InsertHandler(BaseHandler):
     async def handle(self, *args, **kwargs):
         initial_status = kwargs.get('initial_status', 'published')
         owner = kwargs.get('owner')
-        return get_registry().register_with_status(*args, initial_status=initial_status, owner=owner)
+        layer = kwargs.get('layer', LAYER_UNSET)
+        if layer is LAYER_UNSET:
+            return get_registry().register_with_status(
+                *args, initial_status=initial_status, owner=owner
+            )
+        return get_registry().register_with_status(
+            *args, initial_status=initial_status, owner=owner, layer=layer
+        )
 
 
 class QueryHandler(BaseHandler):
     async def handle(self, *args, **kwargs):
-        return get_registry().find_exact(*args)
+        return get_registry().find_exact(*args, **kwargs)
 
 class UpdateHandler(BaseHandler):
     async def handle(self, *args, **kwargs):
         owner = kwargs.get('owner')
-        return get_registry().update(*args, owner=owner)
+        layer = kwargs.get('layer', LAYER_UNSET)
+        if layer is LAYER_UNSET:
+            return get_registry().update(*args, owner=owner)
+        return get_registry().update(*args, owner=owner, layer=layer)
 
 class GetHandler(BaseHandler):
     async def handle(self, *args, **kwargs):
@@ -74,7 +85,7 @@ class GetHandler(BaseHandler):
 
 class RetrieveHandler(BaseHandler):
     async def handle(self, *args, **kwargs):
-        return get_registry().retrieve_by_task(*args)
+        return get_registry().retrieve_by_task(*args, **kwargs)
 
 class DeregisterHandler(BaseHandler):
     async def handle(self, *args, **kwargs):

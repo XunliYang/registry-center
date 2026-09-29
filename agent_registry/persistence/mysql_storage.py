@@ -134,6 +134,24 @@ class MySQLStorage(SqlStorageBackend):
         try:
             with conn.cursor() as cur:
                 cur.execute(MySQLQueries.CREATE_TABLE.value)
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'agent_card' "
+                    "AND column_name = 'layer'"
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "ALTER TABLE agent_card ADD COLUMN layer VARCHAR(64) "
+                        "NOT NULL DEFAULT 'unknown'"
+                    )
+                cur.execute(MySQLQueries.NORMALIZE_LAYER.value)
+                cur.execute(
+                    "SELECT index_name FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'agent_card' "
+                    "AND index_name = 'idx_agent_layer'"
+                )
+                if cur.fetchone() is None:
+                    cur.execute("ALTER TABLE agent_card ADD INDEX idx_agent_layer (layer)")
                 logger.info("Table 'agent_card' and indexes created/verified")
                 cur.execute(MySQLQueries.CREATE_TAG_TABLE.value)
                 logger.info("Table 'tag' and indexes created/verified")
