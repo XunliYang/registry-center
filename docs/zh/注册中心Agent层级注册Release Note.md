@@ -56,6 +56,22 @@ POST /rest/v1/registry-center/agent-registrations/query
 
 AgentCard 文件和签名内容不增加 `layer`。层级只作为注册中心元数据保存和返回。
 
+### Milvus 历史集合迁移脚本
+
+仓库提供 `bin/migrate-milvus-layer.py`，用于检查并迁移已有注册集合。执行前先完成集合备份，建议先使用 dry-run：
+
+```text
+python bin/migrate-milvus-layer.py --uri <milvus-uri> --collection agent_card_collection --mode auto --dry-run
+```
+
+如果已有集合没有显式的 `layer` 字段，脚本会在新集合中复制实体并将缺失或非法值归一化为 `unknown`：
+
+```text
+python bin/migrate-milvus-layer.py --uri <milvus-uri> --collection agent_card_collection --target-collection agent_card_collection_layer_v1 --mode rebuild
+```
+
+脚本不会删除或重命名源集合，也不会自动切换服务使用的集合。目标集合完成数量、主键、向量和 `layer` 校验后，再按部署方式完成集合切换。未完成迁移时，旧集合仍可执行不带 `layer` 的查询；带 `layer` 的写入和过滤请求返回服务暂不可用，避免无提示地返回不完整结果。
+
 ## 升级顺序和备份要求
 
 升级前进入维护窗口，暂停注册、更新以及会整体重写注册元数据的后台任务，保留只读查询。
@@ -81,6 +97,8 @@ AgentCard 文件和签名内容不增加 `layer`。层级只作为注册中心�
 ## 回滚和兼容规则
 
 本版本以向后兼容为主。旧客户端可以继续注册、更新和查询；未携带层级的历史数据按 `unknown` 处理。旧查询接口不改变响应结构，读取层级应使用新增接口。
+
+语义查询的健康状态过滤和候选数量处理保持现有实现，本版本不增加候选补取逻辑。
 
 回滚时先停止新版本写入，再恢复服务版本和数据备份。旧版本若不能保留新增元数据，不能直接恢复写入；应先确认其写入路径不会覆盖 `layer`。Milvus 集合切回迁移前版本后，层级过滤能力需明确标记为不可用，直至重新完成迁移。
 

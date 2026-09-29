@@ -23,6 +23,12 @@ from loguru import logger
 from agent_registry.config import AGENT_NUM_MAX
 from agent_registry.model.agent_layer import AgentLayer, normalize_layer
 from agent_registry.persistence.base import AgentRecord
+from agent_registry.persistence.milvus_layer_migration import (
+    LayerMigrationRequiredError,
+    collection_schema,
+    require_layer_field,
+    schema_output_fields,
+)
 from common.util.app_config import get_conf
 from common.vector_db.vector_db_client.config.vector_db_client import VectorDBClient
 from common.vector_db.vector_db_client.config.vector_db_client_registry import vectordb_tool_register
@@ -45,6 +51,24 @@ class MilvusDBClient(VectorDBClient):
             self.client = MilvusClient(uri=client_uri)
         except Exception as e:
             logger.error(f"Milvus initiation failed: {e}")
+
+    def _output_fields_for_collection(self, collection_name):
+        """Return fields supported by the target collection schema.
+
+        Older collections may not have the static ``layer`` field and may
+        also have dynamic fields disabled.  Keep their existing queries
+        usable, while allowing the layer-aware schema to return all metadata.
+        """
+
+        schema = collection_schema(self.client, collection_name)
+        return schema_output_fields(schema, output_fields)
+
+    def _require_layer_field(self, collection_name):
+        """Ensure layer filtering is only used after collection migration."""
+
+        if not self.client.has_collection(collection_name):
+            self.create_collection({"collection_name": collection_name})
+        require_layer_field(self.client, collection_name)
 
     def create_collection(self, data):
         try:
@@ -120,6 +144,9 @@ class MilvusDBClient(VectorDBClient):
                 self.create_collection(data)
                 logger.info("Collection does not exist in database, created it")
 
+            if insert_entity.get("layer") is not None:
+                self._require_layer_field(collection_name)
+
             # 1. Validate embedding dimension
             embedding = insert_entity.get("embedding", [])
             if not isinstance(embedding, list) or len(embedding) != EMBEDDING_VECTOR_DIVISION_LENGTH:
@@ -142,6 +169,8 @@ class MilvusDBClient(VectorDBClient):
             logger.info(f"Insert success! insert_id:{insert_id}, insert_count:{insert_count}")
             return True
 
+        except LayerMigrationRequiredError:
+            raise
         except Exception as e:
             logger.error(f"Error: There is Exception in insert method: {e}")
             return False
@@ -193,12 +222,17 @@ class MilvusDBClient(VectorDBClient):
                 logger.info("Collection does not exist in database, created it")
                 return self.insert_entity(data)
 
+            if entity.get("layer") is not None:
+                self._require_layer_field(collection_name)
+
             self.client.upsert(
                 collection_name=collection_name,
                 data=entity
             )
             logger.info(f"Upsert successful: collection={collection_name}, id={entity.get('id')}")
             return True
+        except LayerMigrationRequiredError:
+            raise
         except MilvusException as e1:
             logger.error(f"Error: There is MilvusException in update method: {e1}")
             return False
@@ -213,6 +247,8 @@ class MilvusDBClient(VectorDBClient):
         if not self.client.has_collection(collection_name):
                 self.create_collection(data)
                 logger.info("Collection does not exist in database, created it")
+        if data.get("layer") is not None:
+            self._require_layer_field(collection_name)
         try:
             self.client.load_collection(collection_name=collection_name)
             search_kwargs = {
@@ -220,7 +256,7 @@ class MilvusDBClient(VectorDBClient):
                 "data": [query_embedding],
                 "anns_field": "embedding",
                 "limit": top_n,
-                "output_fields": output_fields,
+                "output_fields": self._output_fields_for_collection(collection_name),
                 "search_params": {"metric_type": "L2", "param": {"nprobe": 10}},
             }
             filter_expr = self._build_filter(data)
@@ -258,7 +294,7 @@ class MilvusDBClient(VectorDBClient):
             results = self.client.query(
                 collection_name=collection_name,
                 filter=filter_expr,
-                output_fields=output_fields
+                output_fields=self._output_fields_for_collection(collection_name)
             )
             output = []
             if len(results) == 0:
@@ -285,7 +321,7 @@ class MilvusDBClient(VectorDBClient):
             results = self.client.query(
                 collection_name=collection_name,
                 filter="id != \"\"",
-                output_fields=output_fields,
+                output_fields=self._output_fields_for_collection(collection_name),
                 limit=int(get_conf().get(AGENT_NUM_MAX, 40))  # Max query count per request
             )
             output = []
@@ -340,7 +376,7 @@ class MilvusDBClient(VectorDBClient):
         kwargs = {
             "collection_name": collection_name,
             "filter": filter_expr or 'id != ""',
-            "output_fields": output_fields,
+            "output_fields": self._output_fields_for_collection(collection_name),
         }
         if limit is not None:
             kwargs["limit"] = limit
@@ -358,6 +394,8 @@ class MilvusDBClient(VectorDBClient):
         if owner is not None:
             clauses.append(f'owner == {json.dumps(owner)}')
         filter_expr = self._build_filter({"layer": layer, "status": status})
+        if layer is not None:
+            self._require_layer_field(collection_name)
         if filter_expr:
             clauses.append(filter_expr)
         return [self._entity_to_record(entity) for entity in self._query_records(
@@ -383,9 +421,11 @@ class MilvusDBClient(VectorDBClient):
             "data": [embedding],
             "anns_field": "embedding",
             "limit": top_n,
-            "output_fields": output_fields,
+            "output_fields": self._output_fields_for_collection(collection_name),
             "search_params": {"metric_type": "L2", "param": {"nprobe": 10}},
         }
+        if layer is not None:
+            self._require_layer_field(collection_name)
         filter_expr = self._build_filter({"layer": layer, "status": status})
         if filter_expr:
             search_kwargs["filter"] = filter_expr

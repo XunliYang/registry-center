@@ -67,6 +67,7 @@ from agent_registry.server import (
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
 from agent_registry.agent_registry.agent_card_signer import AgentCardSigner
 from agent_registry.model.agent_layer import normalize_layer
+from agent_registry.persistence.milvus_layer_migration import LayerMigrationRequiredError
 import agent_registry.integration.authn  # noqa: F401 - registers the built-in authn handler
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
@@ -383,7 +384,10 @@ async def list_agents(
             query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
             agents = await query_handle.handle(name, organization)
         else:
-            agents = registry.find_exact(name, organization, layer=layer)
+            try:
+                agents = registry.find_exact(name, organization, layer=layer)
+            except LayerMigrationRequiredError as exc:
+                raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         published_agents = []
         for agent in agents:
             agent_status = registry.get_status(agent.name, agent.provider.organization)
@@ -517,7 +521,10 @@ async def semantic_query(
             agents = await retrieve_handle.handle(task, top_n)
         else:
             registry = get_registry_dependency()
-            agents = registry.retrieve_by_task(task, top_n, layer=layer)
+            try:
+                agents = registry.retrieve_by_task(task, top_n, layer=layer)
+            except LayerMigrationRequiredError as exc:
+                raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         agents = [a for a in agents if not _is_hidden_unhealthy(a.name, a.provider.organization)]
         result = [MessageToDict(a) for a in agents]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
@@ -575,29 +582,32 @@ async def query_agent_registrations(
     operation = OperationName.RETRIEVE_AGENT if query["semantic"] else OperationName.QUERY_AGENT
 
     async with semaphore_guard(retrieve_semaphore if query["semantic"] else query_semaphore):
-        if query["semantic"]:
-            records = registry.retrieve_records_by_task(
-                query["task"], query["top_n"], layer=query["layer"],
-                status="published",
-            )
-            records = _published_healthy_records(records)
-            result = {
-                "agents": [_registration_record_to_dict(record) for record in records],
-                "count": len(records),
-            }
-        else:
-            records = registry.find_records(
-                layer=query["layer"], status="published",
-                limit=query["offset"] + query["limit"] + 1,
-            )
-            records = _published_healthy_records(records)
-            start = query["offset"]
-            page = records[start:start + query["limit"]]
-            result = {
-                "agents": [_registration_record_to_dict(record) for record in page],
-                "count": len(page),
-                "hasMore": start + len(page) < len(records),
-            }
+        try:
+            if query["semantic"]:
+                records = registry.retrieve_records_by_task(
+                    query["task"], query["top_n"], layer=query["layer"],
+                    status="published",
+                )
+                records = _published_healthy_records(records)
+                result = {
+                    "agents": [_registration_record_to_dict(record) for record in records],
+                    "count": len(records),
+                }
+            else:
+                records = registry.find_records(
+                    layer=query["layer"], status="published",
+                    limit=query["offset"] + query["limit"] + 1,
+                )
+                records = _published_healthy_records(records)
+                start = query["offset"]
+                page = records[start:start + query["limit"]]
+                result = {
+                    "agents": [_registration_record_to_dict(record) for record in page],
+                    "count": len(page),
+                    "hasMore": start + len(page) < len(records),
+                }
+        except LayerMigrationRequiredError as exc:
+            raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     await audit_integration(operation, principal, True,
                             {"layer": query["layer"] or '',

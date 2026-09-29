@@ -71,6 +71,7 @@ from agent_registry.model.agent_layer import (
     normalize_registration_item,
     RegistrationItem,
 )
+from agent_registry.persistence.milvus_layer_migration import LayerMigrationRequiredError
 from agent_registry.registry_instance import get_registry, initialize_registry
 from agent_registry.middleware import ConnectionLimitMiddleware, TimeoutMiddleware
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
@@ -677,6 +678,10 @@ async def _perform_registration(
             kwargs["layer"] = layer
         success = await save_handle.handle(agent, **kwargs)
         return success
+    except LayerMigrationRequiredError as e:
+        details["message"] = str(e)
+        await _audit_failure(OperationName.REGISTER_AGENT, details, client_ip, caller)
+        raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
     except ValueError as e:
         details["message"] = str(e)
         await _audit_failure(OperationName.REGISTER_AGENT, details, client_ip, caller)
@@ -709,6 +714,10 @@ async def _perform_update(
         if success:
             await _audit_result(OperationName.UPDATE_AGENT, True, details, client_ip, caller)
         return success
+    except LayerMigrationRequiredError as e:
+        details["message"] = str(e)
+        await _audit_failure(OperationName.UPDATE_AGENT, details, client_ip, caller)
+        raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
     except ValueError as e:
         details["message"] = str(e)
         await _audit_failure(OperationName.UPDATE_AGENT, details, client_ip, caller)
@@ -873,7 +882,10 @@ async def list_agents_exact(
             query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
             agents = await query_handle.handle(name, organization)
         else:
-            agents = registry.find_exact(name, organization, layer=layer)
+            try:
+                agents = registry.find_exact(name, organization, layer=layer)
+            except LayerMigrationRequiredError as exc:
+                raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
         published_agents = []
         for agent in agents:
@@ -1057,7 +1069,10 @@ async def retrieve_agents_by_task(
             retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
             agents = await retrieve_handle.handle(task, top_n)
         else:
-            agents = registry.retrieve_by_task(task, top_n, layer=layer)
+            try:
+                agents = registry.retrieve_by_task(task, top_n, layer=layer)
+            except LayerMigrationRequiredError as exc:
+                raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         agents = [agent for agent in agents
                   if not _is_hidden_unhealthy(agent.name, agent.provider.organization)]
         result = [MessageToDict(agent) for agent in agents]
@@ -1160,21 +1175,24 @@ async def query_agent_registrations(
     )
 
     async with semaphore_guard(retrieve_semaphore if query["semantic"] else query_semaphore):
-        if query["semantic"]:
-            records = registry.retrieve_records_by_task(
-                query["task"], query["top_n"], layer=query["layer"],
-                status="published",
-            )
-            records = _published_healthy_records(records)
-            return {
-                "agents": [_registration_record_to_dict(record) for record in records],
-                "count": len(records),
-            }
+        try:
+            if query["semantic"]:
+                records = registry.retrieve_records_by_task(
+                    query["task"], query["top_n"], layer=query["layer"],
+                    status="published",
+                )
+                records = _published_healthy_records(records)
+                return {
+                    "agents": [_registration_record_to_dict(record) for record in records],
+                    "count": len(records),
+                }
 
-        records = registry.find_records(
-            layer=query["layer"], status="published",
-            limit=query["offset"] + query["limit"] + 1,
-        )
+            records = registry.find_records(
+                layer=query["layer"], status="published",
+                limit=query["offset"] + query["limit"] + 1,
+            )
+        except LayerMigrationRequiredError as exc:
+            raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         records = _published_healthy_records(records)
         start = query["offset"]
         page = records[start:start + query["limit"]]

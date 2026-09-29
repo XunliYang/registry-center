@@ -23,6 +23,7 @@ from agent_registry.model.agent_layer import (
 )
 from agent_registry.persistence.base import AgentRecord
 from agent_registry.persistence.file_storage import FileStorage
+from agent_registry.persistence.milvus_layer_migration import LayerMigrationRequiredError
 from agent_registry.persistence.sqlite_storage import SQLiteStorage
 from agent_registry.server import app, _parse_layer_query_body
 from agent_registry.signature.agent_card_signature_validator import (
@@ -285,3 +286,20 @@ class TestLayerAwareEndpoints:
         registry.find_records.assert_called_once_with(
             layer="omc", status="published", limit=11
         )
+
+    def test_layer_query_reports_unmigrated_vector_collection(self):
+        registry, _, _ = self._dependencies()
+        registry.find_records.side_effect = LayerMigrationRequiredError(
+            "Milvus collection 'agent_card_collection' has no layer field"
+        )
+        handler = MagicMock()
+        handler.handle = AsyncMock(return_value=None)
+
+        with patch("common.custom.custom_handle.HandlerRegistry.get_handler", return_value=handler):
+            response = TestClient(app).post(
+                "/rest/v1/registry-center/agent-registrations/query",
+                json={"layer": "omc", "limit": 10},
+            )
+
+        assert response.status_code == 503
+        assert "no layer field" in response.json()["errors"]["error"][0]["errorMessage"]
