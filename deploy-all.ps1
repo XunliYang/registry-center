@@ -26,7 +26,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $cleanupVars = @('GCP_PROJECT_ID', 'GCP_REGION', 'DB_PASSWORD', 'PERSISTENCE_MODE', 'DB_HOST', 'DB_PORT',
                  'DB_NAME', 'DB_USERNAME', 'DB_POOL_MIN', 'DB_POOL_MAX',
                  'REGISTRY_ENABLE_HTTPS', 'REGISTRY_FORWARDED_ALLOW_IPS',
-                 'REGISTRY_OWNER__VALIDATION__MODE')
+                 'REGISTRY_OWNER_VALIDATION_MODE')
 foreach ($v in $cleanupVars) {
     Remove-Item "env:$v" -ErrorAction SilentlyContinue
 }
@@ -232,8 +232,11 @@ $envVars += ",DB_PASSWORD=$env:DB_PASSWORD"
 $envVars += ",DB_POOL_MIN=2"
 $envVars += ",DB_POOL_MAX=10"
 $envVars += ",REGISTRY_ENABLE_HTTPS=false"
+# Cloud Run terminates TLS and rewrites X-Forwarded-* itself, and the proxy address
+# is not stable, so the platform front end is trusted here. Never use "*" for
+# owner.trusted.proxy.ips (ownership authentication stays on the verified identity).
 $envVars += ",REGISTRY_FORWARDED_ALLOW_IPS=*"
-$envVars += ",REGISTRY_OWNER__VALIDATION__MODE=relaxed"
+$envVars += ",REGISTRY_OWNER_VALIDATION_MODE=relaxed"
 
 Write-Host "  DB_HOST: /cloudsql/$CLOUDSQL_CONN"
 

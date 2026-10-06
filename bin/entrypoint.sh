@@ -44,23 +44,25 @@ if [ -n "${REGISTRY_ENABLE_HTTPS}" ]; then
 fi
 
 if [ -n "${REGISTRY_FORWARDED_ALLOW_IPS}" ]; then
-    sed -i "s#^forwarded_allow_ips=.*#forwarded_allow_ips=\"${REGISTRY_FORWARDED_ALLOW_IPS}\"#" "${SERVER_CONF}"
+    # No quotes around the value: the config reader strips whitespace only, and
+    # uvicorn compares each trusted-proxy entry literally.
+    sed -i "s#^forwarded_allow_ips=.*#forwarded_allow_ips=${REGISTRY_FORWARDED_ALLOW_IPS}#" "${SERVER_CONF}"
     echo "Config override: forwarded_allow_ips=${REGISTRY_FORWARDED_ALLOW_IPS}"
 fi
 
-if [ -n "${REGISTRY_OWNER__VALIDATION__MODE}" ]; then
-    sed -i "s#^owner.validation.mode=.*#owner.validation.mode=${REGISTRY_OWNER__VALIDATION__MODE}#" "${SERVER_CONF}"
-    echo "Config override: owner.validation.mode=${REGISTRY_OWNER__VALIDATION__MODE}"
+# REGISTRY_OWNER_VALIDATION_MODE maps to owner.validation.mode through the
+# REGISTRY_* env overrides in common/util/app_config.py. The legacy
+# double-underscore spelling is still accepted here so existing deployments keep
+# working when they override the image default.
+OWNER_VALIDATION_MODE_OVERRIDE="${REGISTRY_OWNER_VALIDATION_MODE:-${REGISTRY_OWNER__VALIDATION__MODE}}"
+if [ -n "${OWNER_VALIDATION_MODE_OVERRIDE}" ]; then
+    sed -i "s#^owner.validation.mode=.*#owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}#" "${SERVER_CONF}"
+    echo "Config override: owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}"
 fi
 
-# When HTTPS is disabled, also disable cert verification and registry signing
-if [ "${REGISTRY_ENABLE_HTTPS}" = "false" ]; then
-    sed -i "s#^verify_client=.*#verify_client=false#" "${SERVER_CONF}"
-    sed -i "s#^registry.sign.enabled=.*#registry.sign.enabled=false#" "${SERVER_CONF}"
-    sed -i "s#^signature_validation_enabled=.*#signature_validation_enabled=false#" "${SERVER_CONF}"
-    sed -i "s#^owner.isolation.enabled=.*#owner.isolation.enabled=false#" "${SERVER_CONF}"
-    echo "Config override: HTTPS disabled → verify_client=false, signing/validation disabled"
-fi
+# TLS may terminate at a trusted reverse proxy. Disabling listener HTTPS must
+# not disable independent caller authorization or AgentCard integrity checks.
+# Development deployments explicitly choose their own policy via REGISTRY_*.
 
 # --- persistence.conf overrides (using # to handle /cloudsql/ paths safely) ---
 if [ -n "${PERSISTENCE_MODE}" ]; then
