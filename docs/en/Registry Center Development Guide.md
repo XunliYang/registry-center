@@ -27,7 +27,7 @@ Registry Center is a service focused on unified Agent management, enabling users
 ### Functional Limitations
 
 - This project is intended as a functional module only, not a complete system. The module itself does not provide login authentication, authorization, user management, audit logging, encryption/decryption, key management, database, or other capabilities. These security infrastructures must be provided by the customer system. Hook methods have been reserved in the source code for secondary customization.
-- By default, registered Agents are treated as public resources. There is currently no Agent owner design.
+- Registered Agents are shared resources by default: read paths expose only cards whose status is `published`. Ownership enforcement (`owner.isolation.enabled`) is off by default; when enabled, the owner comes from the verified TLS client certificate or an explicitly trusted proxy, and cards without an owner require administrative ownership assignment. See the [Security Guide](Registry%20Center%20Security%20Guide.md) for the identity trust chain.
 - AgentCards registered with this project must not contain personal data such as phone numbers, or sensitive information such as passwords or credentials, as doing so poses a risk of information leakage.
 - This project only supports AgentCard registration in Chinese and English.
 - Currently supports single-instance deployment, intended for internal systems only. It must not be exposed to the public internet and must not be deployed as a cloud service.
@@ -556,7 +556,7 @@ The Registry Center supports Agent heartbeat detection and change broadcast: Age
 
     Notes:
     - Administrators can monitor Agent health via `GET /rest/v1/registry-center/agents/health` with optional status filtering.
-    - Offline Agents are marked but not hidden by default; automatic hiding can be enabled via `heartbeat.hide.unhealthy.results=true`.
+    - Offline Agents are marked but not hidden by default; automatic hiding from task-discovery results can be enabled via `heartbeat.hide.unhealthy.results=true`. The health list/history/SSE are not affected by this switch, so offline alerts remain visible.
 
 ## Configuration Extension Scenario
 
@@ -607,9 +607,14 @@ Implement custom functionality through extended configuration, including storage
     # WARNING: this switch does not add a semantic-search index on top of the
     # existing store - it replaces it. When enabled, RegistryCore no longer
     # initializes the file/SQL backend, AgentCards are written only to the
-    # vector DB, and approval (update_status), tags, full listing, status and
-    # timestamps stop working (they silently return empty values or fail).
-    # Semantic search itself works, but do not enable this in production.
+    # vector DB, and approval (update_status), tags (including tag entities),
+    # card listings, ownership, metadata and timestamps report HTTP 503
+    # (AuthoritativeStoreUnavailable) instead of silently returning empty
+    # values. Updates and deregistration are refused too, because they could not
+    # announce themselves to the change feed. Registration and exact card lookup
+    # still work, so the collection can be populated and read by key.
+    # Do not enable this in production; set startup.strict.storage=true to make
+    # the process refuse to start in this mode.
     # The intended "authoritative store + rebuildable index" layering is a
     # future refactor and is not implemented yet.
     use_vectordb=true
@@ -983,10 +988,17 @@ Restart the service after changes; model clients are cached. Use `python -m scri
 | agent_approval_enabled | Agent approval toggle | false                   |
 | owner.isolation.enabled | Owner isolation toggle | true                    |
 | use_vectordb | Enable vector database (replaces the authoritative store; see the warning above) | false                   |
+| startup.strict.storage | Refuse to start when use_vectordb=true leaves no authoritative record store | false                   |
 | jwk_cert_path | JWK signing certificate path | etc/ssl/server.cer |
 | jwk_private_key_path | JWK private key directory | etc/sign_cert |
 | jwk_private_key_password | JWK private key passphrase | '' |
 | registry.sign.enabled | Registry Center signing toggle | true |
+
+Note: the owner/identity rows above are the values shipped in the sample
+`etc/conf/server.conf`. The built-in code defaults are
+`owner.isolation.enabled=false`, `owner.validation.mode=strict`, and
+`owner.identity.mode=certificate`; see the
+[Security Guide](Registry%20Center%20Security%20Guide.md).
 
 #### persistence.conf Configuration Items
 
