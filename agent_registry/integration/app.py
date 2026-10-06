@@ -33,6 +33,7 @@ main endpoints via the extracted _process_* helpers in server.py.
 
 from typing import Any, List, Optional
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -43,14 +44,16 @@ from loguru import logger
 from agent_registry.broadcast import get_broadcast_service
 from agent_registry.broadcast.subscriptions import Subscription
 from agent_registry.core import RegistryCore
+from agent_registry.errors import AuthoritativeStoreUnavailable, RegistryUnavailableError
 from agent_registry.server import (
     CustomHTTPException,
     get_registry_signer,
     get_signature_validator,
-    _is_hidden_unhealthy,
+    _is_discoverable,
     _process_register_cards,
     _process_update_cards,
     _validate_callback_url,
+    _parse_json_object,
 )
 from agent_registry.server import (
     deregister_semaphore,
@@ -63,6 +66,7 @@ from agent_registry.server import (
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
 from agent_registry.agent_registry.agent_card_signer import AgentCardSigner
 import agent_registry.integration.authn  # noqa: F401 - registers the built-in authn handler
+from agent_registry.request_validation import card_batch, semantic_query as validate_semantic_query
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
 from common.log.audit_logger import (
@@ -300,6 +304,14 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
     )
 
 
+@integration_app.exception_handler(RegistryUnavailableError)
+async def registry_unavailable_handler(request: Request, exc: RegistryUnavailableError):
+    """Same 503 contract as the main port (R4/R12: no record store, no model)."""
+    logger.warning(f"Rejecting {request.url.path}: {exc}")
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={"errors": {"error": [{"errorMessage": str(exc)}]}})
+
+
 @integration_app.exception_handler(AuthorizationError)
 async def authorization_exception_handler(request: Request, exc: AuthorizationError):
     return JSONResponse(status_code=status.HTTP_403_FORBIDDEN,
@@ -339,11 +351,8 @@ async def register_agent(
             op_name=OperationName.REGISTER_AGENT)),
 ):
     """Register new agent cards. New cards are owned by the credential identity."""
-    body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "agentCards must be a non-empty list")
+    body = await _parse_json_object(request)
+    agent_cards = card_batch(body)
     registry = get_registry_dependency()
     signature_validator = get_signature_validator()
     registry_signer = get_registry_signer()
@@ -375,10 +384,9 @@ async def list_agents(
         registry = get_registry_dependency()
         published_agents = []
         for agent in agents:
-            agent_status = registry.get_status(agent.name, agent.provider.organization)
-            if agent_status != 'published':
-                continue
-            if _is_hidden_unhealthy(agent.name, agent.provider.organization):
+            # Same predicate as the main port: status *and* health hiding. Keeping a
+            # second copy of the rule here is how a pending card leaks out of one port.
+            if not _is_discoverable(agent.name, agent.provider.organization, registry):
                 continue
             published_agents.append(MessageToDict(agent))
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
@@ -404,10 +412,8 @@ async def get_agent(
         record = await get_handle.handle(name, organization)
         registry = get_registry_dependency()
         result: List[dict] = []
-        if record is not None:
-            agent_status = registry.get_status(name, organization)
-            if agent_status == 'published' and not _is_hidden_unhealthy(name, organization):
-                result = [MessageToDict(record.agent_card)]
+        if record is not None and _is_discoverable(name, organization, registry):
+            result = [MessageToDict(record.agent_card)]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
                                 {"name": name, "organization": organization,
                                  "found": bool(result)})
@@ -434,11 +440,8 @@ async def update_agent(
         await audit_integration_failure(OperationName.UPDATE_AGENT, principal, details)
         raise AuthorizationError("Vendor agents may only update their own agent cards")
 
-    body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "agentCards must be a non-empty list")
+    body = await _parse_json_object(request)
+    agent_cards = card_batch(body)
     owner_param = principal.identity if principal.role == CallerRole.VENDOR_AGENT else None
     return await _process_update_cards(
         agent_cards, principal.client_ip, name, organization, owner_param,
@@ -487,21 +490,16 @@ async def semantic_query(
             op_name=OperationName.RETRIEVE_AGENT)),
 ):
     """Find agents semantically relevant to a task description (LLM-backed)."""
-    body = await request.json()
-    task = body.get("task", '')
-    try:
-        top_n = int(body.get("topN", 10))
-    except (TypeError, ValueError):
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "topN must be an integer")
-    top_n = max(1, min(top_n, 50))
+    body = await _parse_json_object(request)
+    task, top_n = validate_semantic_query(body, body.get('topN', 10))
     async with semaphore_guard(retrieve_semaphore):
         retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
         agents = await retrieve_handle.handle(task, top_n)
-        agents = [a for a in agents if not _is_hidden_unhealthy(a.name, a.provider.organization)]
+        registry = get_registry_dependency()
+        agents = [a for a in agents if _is_discoverable(a.name, a.provider.organization, registry)]
         result = [MessageToDict(a) for a in agents]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
-                                {"task": task[:200], "count": len(result)})
+                                {"top_n": top_n, "count": len(result)})
         return {"agentCards": result}
 
 
@@ -547,7 +545,7 @@ async def create_subscription(
     parity with the main port: broadcast gate, event-type validation,
     dispatcher wiring, caller-provided secret."""
     _require_broadcast_enabled()
-    body = await request.json()
+    body = await _parse_json_object(request)
     callback_url = body.get("callbackUrl", '')
     if not callback_url:
         raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -576,7 +574,7 @@ async def create_subscription(
         broadcast_service.dispatcher.add_subscription(created)
     await audit_integration(OperationName.CREATE_SUBSCRIPTION, principal, True,
                             {"subscriptionId": created.subscription_id,
-                             "callbackUrl": callback_url})
+                             "callbackHost": urlsplit(callback_url).hostname or ''})
     payload = created.to_dict(include_secret=True)
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=payload)
 

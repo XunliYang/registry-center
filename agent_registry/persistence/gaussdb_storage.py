@@ -45,6 +45,7 @@ class GaussDBStorage(SqlStorageBackend):
 
     queries = GaussDBQueries
     _integrity_error = psycopg2.IntegrityError
+    dialect = "gaussdb"
 
     def __init__(self, conn_pool: pool.ThreadedConnectionPool):
         self.pool = conn_pool

@@ -15,10 +15,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import httpx
+import json
 from typing import Optional, Callable, Set
 from urllib.parse import urlparse
 from jwt import PyJWK
 from loguru import logger
+from pydantic import ValidationError
 from agent_registry.signature.models import JWK, JWKS
 from agent_registry.signature.public_key_manager import PublicKeyManager
 
@@ -27,6 +29,7 @@ class JWKFetcher:
     """JWK fetcher"""
 
     REQUEST_TIMEOUT = 10
+    MAX_JWKS_BYTES = 1_048_576
 
     def __init__(
         self,
@@ -60,7 +63,10 @@ class JWKFetcher:
             return False
 
         try:
-            host = (urlparse(jku).hostname or "").lower()
+            parsed = urlparse(jku)
+            host = (parsed.hostname or "").lower()
+            if parsed.username or parsed.password:
+                return False
         except Exception as e:
             logger.error(f"Failed to parse jku URL '{jku}': {e}")
             return False
@@ -95,28 +101,65 @@ class JWKFetcher:
                 logger.error(f"JKU must use HTTPS: {jku}")
                 return None
 
-            response = await self.session.get(jku)
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch JWKS, status: {response.status_code}")
-                return None
-
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > 1_048_576:
-                logger.error(f"JWKS response too large: {content_length} bytes (max 1MB)")
-                return None
-
-            jwks_data = response.json()
-            return JWKS(**jwks_data)
+            async with self.session.stream('GET', jku, follow_redirects=False) as response:
+                if response.status_code != 200:
+                    logger.warning("JWKS fetch returned HTTP {}", response.status_code)
+                    return None
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > self.MAX_JWKS_BYTES:
+                    return None
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > self.MAX_JWKS_BYTES:
+                        logger.warning('JWKS response exceeds configured size limit')
+                        return None
+                    body.extend(chunk)
+            jwks_data = json.loads(body)
+            return self._build_jwks(jwks_data)
 
         except httpx.TimeoutException:
             logger.error(f"Timeout while fetching JWKS from: {jku}")
             return None
+
         except httpx.HTTPError as e:
             logger.error(f"Request error while fetching JWKS: {e}")
             return None
         except Exception as e:
             logger.error(f"Error while fetching JWKS: {e}")
             return None
+
+    async def aclose(self) -> None:
+        """Release the fetcher's network connection pool on service shutdown."""
+        await self.session.aclose()
+
+    @staticmethod
+    def _build_jwks(payload: object) -> Optional[JWKS]:
+        """Build a key set from a fetched JWKS document, key by key.
+
+        Third-party key sets commonly publish entries this verifier cannot use
+        (encryption keys, other curves or algorithms). Such an entry must not
+        discard the whole set: unsupported keys are skipped and the result fails
+        closed only when no usable verification key remains.
+        """
+        if not isinstance(payload, dict) or not isinstance(payload.get('keys'), list):
+            logger.warning('JWKS payload is not a key set')
+            return None
+        usable = []
+        skipped = 0
+        for entry in payload['keys']:
+            if not isinstance(entry, dict) or entry.get('use') not in (None, 'sig'):
+                skipped += 1
+                continue
+            try:
+                usable.append(JWK(**entry))
+            except ValidationError:
+                skipped += 1
+        if skipped:
+            logger.info("Ignored {} unusable JWKS key(s)", skipped)
+        if not usable:
+            logger.warning('JWKS contains no usable signature verification key')
+            return None
+        return JWKS(keys=usable)
 
     @staticmethod
     def find_key_by_id(jwks: JWKS, kid: str) -> Optional[JWK]:
@@ -231,12 +274,15 @@ class JWKFetcher:
             jwt.api_jwk.PyJWK object.
         """
         try:
+            if jwk.use != 'sig':
+                raise ValueError('Key is not intended for signature verification')
             pyjwk_dict = {
                 "kty": jwk.kty,
                 "kid": jwk.kid,
                 "use": jwk.use,
-                "alg": jwk.alg
             }
+            if jwk.alg:
+                pyjwk_dict['alg'] = jwk.alg
 
             if jwk.kty == "EC":
                 if jwk.crv:

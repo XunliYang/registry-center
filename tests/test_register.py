@@ -157,7 +157,7 @@ class TestRegistryCoreFileMode:
         assert agent.description == "Updated desc"
 
     def test_update_not_found(self, registry):
-        result = registry.update("Ghost", "Org", {"name": "Ghost"})
+        result = registry.update("Ghost", "Org", {"name": "Ghost", "provider": {"organization": "Org"}})
         assert result is False
 
     def test_update_changes_name_raises(self, registry):

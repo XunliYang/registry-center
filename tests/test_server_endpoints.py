@@ -32,6 +32,15 @@ from agent_registry.signature.agent_card_signature_validator import (
 )
 
 
+@pytest.fixture(autouse=True)
+def endpoint_policy(monkeypatch):
+    """CRUD response tests are independent of local ownership configuration.
+
+    TLS ownership enforcement is covered by test_owner_identity.py.
+    """
+    monkeypatch.setattr('agent_registry.server.OWNER_ISOLATION_ENABLED', False)
+
+
 VALID_AGENT_CARD = {
     "name": "TestAgent",
     "provider": {"organization": "TestOrg", "url": "https://test.org"},
@@ -72,7 +81,7 @@ def mock_registry():
 @pytest.fixture
 def mock_validator():
     mock = MagicMock(spec=AgentCardSignatureValidator)
-    mock.validate_agent_card.return_value = ValidationResult(is_valid=True)
+    mock.validate_agent_card_async = AsyncMock(return_value=ValidationResult(is_valid=True))
     return mock
 
 
@@ -119,14 +128,15 @@ class TestRegisterEndpoint:
                 "registrySigned": False,
             }]
 
-    def test_register_batch_failure_reports_registered_agents(self, mock_registry, mock_validator, mock_signer):
+    @pytest.mark.parametrize('invalid_card', [dict(VALID_AGENT_CARD, name='Bad Agent!'),
+                                             {'unknownField': 1}, False])
+    def test_register_batch_failure_reports_registered_agents(self, mock_registry, mock_validator, mock_signer, invalid_card):
         _override_deps(mock_registry, mock_validator, mock_signer)
         mock_handler = MagicMock()
         mock_handler.handle = AsyncMock(return_value=True)
 
         with patch('common.custom.custom_handle.HandlerRegistry.get_handler', return_value=mock_handler):
             client = TestClient(app)
-            invalid_card = dict(VALID_AGENT_CARD, name="Bad Agent!")
             response = client.post(
                 "/rest/v1/registry-center/agent-cards",
                 json={"agentCards": [VALID_AGENT_CARD, invalid_card]}
@@ -168,6 +178,28 @@ class TestRegisterEndpoint:
 
 
 class TestUpdateEndpoint:
+
+    @pytest.mark.parametrize('second_card', [{'unknownField': 1}, False,
+                                             dict(VALID_AGENT_CARD, name='Renamed')])
+    def test_partial_update_reports_completed_cards(self, mock_registry, mock_validator, mock_signer, second_card):
+        _override_deps(mock_registry, mock_validator, mock_signer)
+        handler = MagicMock(handle=AsyncMock(return_value=True))
+        with patch('common.custom.custom_handle.HandlerRegistry.get_handler', return_value=handler):
+            response = TestClient(app).put('/rest/v1/registry-center/agent-cards/TestOrg/TestAgent',
+                                           json={'agentCards': [VALID_AGENT_CARD, second_card]})
+        assert response.status_code == 422
+        assert len(response.json()['updatedAgents']) == 1
+        assert response.json()['updatedAgents'][0]['name'] == 'TestAgent'
+        mock_validator.validate_agent_card_async.assert_awaited_once()
+
+    def test_identity_mismatch_is_rejected_before_signature_validation(self, mock_registry, mock_validator, mock_signer):
+        _override_deps(mock_registry, mock_validator, mock_signer)
+        handler = MagicMock(handle=AsyncMock(return_value=True))
+        with patch('common.custom.custom_handle.HandlerRegistry.get_handler', return_value=handler):
+            response = TestClient(app).put('/rest/v1/registry-center/agent-cards/TestOrg/TestAgent',
+                                           json={'agentCards': [dict(VALID_AGENT_CARD, name='Renamed')]})
+        assert response.status_code == 422
+        mock_validator.validate_agent_card_async.assert_not_awaited()
 
     def test_update_success_returns_result_body(self, mock_registry, mock_validator, mock_signer):
         _override_deps(mock_registry, mock_validator, mock_signer)

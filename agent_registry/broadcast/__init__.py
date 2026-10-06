@@ -65,6 +65,8 @@ class BroadcastService:
                 backoff_base=_float_conf(config, "broadcast.webhook.backoff.base", 2.0),
                 backoff_max=_float_conf(config, "broadcast.webhook.backoff.max", 300.0),
                 retention_days=_int_conf(config, "broadcast.outbox.retention.days", 7),
+                delivery_max_attempts=_int_conf(config, "broadcast.delivery.max.attempts", 5),
+                retry_interval=_float_conf(config, "broadcast.delivery.retry.interval", 60.0),
             )
             self.event_bus.attach_dispatcher(self.dispatcher)
 

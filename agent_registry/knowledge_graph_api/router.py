@@ -40,6 +40,8 @@ from neo4j import GraphDatabase, Driver
 from agent_registry.config import PERSISTENCE_CONF
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
+from common.util.app_config import get_conf
+from agent_registry.identity import resolve_caller_identity
 
 # ---------------------------------------------------------------------------
 # Endpoint guard: per-IP rate limit + main-port authentication slot.
@@ -63,12 +65,31 @@ def _kg_rate():
 
 
 async def kg_guard(request: Request) -> None:
+    config = get_conf()
+    enabled = config.get('knowledge_graph.enabled', config.get('knowledge_graph_enabled', 'false'))
+    if str(enabled).lower() != 'true':
+        raise HTTPException(status_code=404, detail="Knowledge graph API is disabled")
     client_ip = request.client.host if request.client else ''
     if not _kg_strategy.hit(_kg_rate(), 'knowledge_graph', client_ip):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Rate limit exceeded")
     auth_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
-    await auth_handle.handle(client_ip, request)
+    principal = await auth_handle.handle(client_ip, request)
+    identity = resolve_caller_identity(request, config)
+    # Authentication plugins may supply an authenticated principal; the
+    # default main-port handler is anonymous, so use verified TLS identity.
+    subject = getattr(principal, 'owner', '') or getattr(principal, 'subject', '')
+    if not subject and identity.verified:
+        subject = identity.owner
+    if not subject:
+        raise HTTPException(status_code=401, detail="Authenticated graph operator required")
+    raw = config.get('knowledge_graph.allowed.owners',
+                     config.get('knowledge_graph_allowed_owners', ''))
+    operators = {value.strip() for value in str(raw).split(',') if value.strip()}
+    required_scope = 'knowledge_graph:read' if request.method in ('GET', 'HEAD') else 'knowledge_graph:write'
+    scopes = getattr(principal, 'scopes', ()) or ()
+    if subject not in operators and required_scope not in scopes:
+        raise HTTPException(status_code=403, detail="Graph operator permission required")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +132,9 @@ def get_neo4j_driver() -> Driver:
     if _neo4j_driver is None:
         uri = PERSISTENCE_CONF.get('neo4j.uri', 'bolt://localhost:7687')
         user = PERSISTENCE_CONF.get('neo4j.username', 'neo4j')
-        password = PERSISTENCE_CONF.get('neo4j.password', 'password')
+        password = PERSISTENCE_CONF.get('neo4j.password', '')
+        if not password:
+            raise HTTPException(status_code=503, detail="Neo4j credentials are not configured")
         _neo4j_driver = GraphDatabase.driver(uri, auth=(user, password))
         logger.info(f"Neo4j driver initialized for Knowledge Graph API: {uri}")
     return _neo4j_driver
@@ -771,12 +794,15 @@ async def import_graph(import_data: Dict[str, Any]):
         # Create relationships
         for i, rel_data in enumerate(import_data.get('relationships', [])):
             try:
-                required = ['type', 'startNodeId', 'endNodeId']
-                for field in required:
-                    if field not in rel_data:
-                        errors.append({"index": i, "message": f"Missing field: {field}"})
-                        continue
-                
+                missing = [field for field in ('type', 'startNodeId', 'endNodeId')
+                           if field not in rel_data]
+                if missing:
+                    # Report once and skip the item: falling through used to raise
+                    # KeyError below and append a second, less useful error entry.
+                    errors.append({"index": i,
+                                   "message": "Missing field: " + ", ".join(missing)})
+                    continue
+
                 rel_type = _validate_identifier(rel_data['type'], "relationship type")
                 query = f"""
                     MATCH (start), (end)
@@ -793,7 +819,7 @@ async def import_graph(import_data: Dict[str, Any]):
             except Exception as e:
                 errors.append({"index": i, "message": str(e)})
         
-        return {
+        payload = {
             "success": True,
             "data": {
                 "nodesCreated": nodes_created,
@@ -801,6 +827,13 @@ async def import_graph(import_data: Dict[str, Any]):
                 "errors": errors if errors else []
             }
         }
+        if errors and not nodes_created and not rels_created:
+            # Nothing was imported: 201 Created would tell the caller the graph
+            # changed. Report the per-item errors with an unprocessable status.
+            payload["success"] = False
+            return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                content=payload)
+        return payload
 
 
 @knowledge_graph_router.get("/export", summary="Export graph data")
@@ -809,8 +842,6 @@ async def export_graph(
     format: str = Query("json", description="Export format", pattern="^json$")
 ):
     """Export graph data with optional filtering."""
-    driver = get_neo4j_driver()
-    
     # Parse filter parameters
     filters = {}
     if filter:
@@ -818,6 +849,16 @@ async def export_graph(
             if '=' in param:
                 key, value = param.split('=', 1)
                 filters[key] = value
+    # Reject malformed identifiers before creating a connection or opening a
+    # session, including when the backing graph is not configured.
+    if 'label' in filters:
+        _validate_identifier(filters['label'], 'label')
+    if 'property' in filters:
+        parts = filters['property'].split(':', 1)
+        if len(parts) != 2:
+            raise HTTPException(status_code=422, detail='Property filter must be key:value')
+        _validate_identifier(parts[0], 'property key')
+    driver = get_neo4j_driver()
     
     with driver.session() as session:
         nodes = []

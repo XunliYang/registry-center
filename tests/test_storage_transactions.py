@@ -370,8 +370,8 @@ def test_outbox_version_column_is_unique(sqlite_storage, outbox):
         )
 
 
-def test_sqlite_outbox_acquires_connection_before_outbox_lock(sqlite_storage, outbox):
-    """Independent health events and registry writes must use one lock order."""
+def test_sqlite_outbox_uses_connection_lock_without_a_second_process_lock(sqlite_storage, outbox):
+    """The connection lock serializes the complete SQLite unit of work."""
     acquired = []
 
     class _TracingLock:
@@ -392,7 +392,8 @@ def test_sqlite_outbox_acquires_connection_before_outbox_lock(sqlite_storage, ou
 
     outbox.append(_event())
 
-    assert acquired[:2] == ["connection", "outbox"]
+    assert acquired and acquired[0] == 'connection'
+    assert 'outbox' not in acquired
     assert outbox.max_version() == 1
 
 

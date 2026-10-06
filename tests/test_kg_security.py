@@ -20,10 +20,16 @@ from agent_registry.knowledge_graph_api import router as kg_router_module
 from agent_registry.knowledge_graph_api.router import knowledge_graph_router
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
+from common.util.authenticate_util import Principal
+from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.fixture
 def client(monkeypatch):
+    monkeypatch.setattr(kg_router_module, 'get_conf', lambda: {
+        'knowledge_graph.enabled': 'true', 'knowledge_graph.allowed.owners': 'graph-admin'})
+    monkeypatch.setitem(HandlerRegistry._instances, InterfaceType.AUTHENTICATE.value,
+                        MagicMock(handle=AsyncMock(return_value=Principal('127.0.0.1', identity='graph-admin'))))
     from limits import parse as parse_rate_limit
     from limits import storage as limit_storage, strategies as limit_strategies
     monkeypatch.setattr(kg_router_module, "_kg_rate_item",
@@ -75,6 +81,33 @@ def _set_auth_error(monkeypatch, error):
 
 
 class TestEndpointGuard:
+    def test_disabled_by_default_before_driver_access(self, client, monkeypatch):
+        monkeypatch.setattr(kg_router_module, 'get_conf', lambda: {})
+        driver = MagicMock()
+        monkeypatch.setattr(kg_router_module, 'get_neo4j_driver', driver)
+        assert client.get('/rest/v1/registry-center/knowledge-graph/nodes').status_code == 404
+        driver.assert_not_called()
+
+    def test_anonymous_identity_header_does_not_grant_graph_access(self, client, monkeypatch):
+        monkeypatch.setitem(HandlerRegistry._instances, InterfaceType.AUTHENTICATE.value,
+                            MagicMock(handle=AsyncMock(return_value=Principal('127.0.0.1'))))
+        response = client.get('/rest/v1/registry-center/knowledge-graph/nodes',
+                              headers={'X-SSL-Client-DN': 'CN=graph-admin'})
+        assert response.status_code == 401
+
+    def test_authenticated_non_operator_is_rejected(self, client, monkeypatch):
+        monkeypatch.setitem(HandlerRegistry._instances, InterfaceType.AUTHENTICATE.value,
+                            MagicMock(handle=AsyncMock(return_value=Principal('127.0.0.1', identity='agent'))))
+        assert client.get('/rest/v1/registry-center/knowledge-graph/nodes').status_code == 403
+
+    def test_read_scope_cannot_write(self, client, monkeypatch):
+        monkeypatch.setitem(HandlerRegistry._instances, InterfaceType.AUTHENTICATE.value,
+                            MagicMock(handle=AsyncMock(return_value=Principal(
+                                '127.0.0.1', identity='reader', scopes=['knowledge_graph:read']))))
+        monkeypatch.setattr(kg_router_module, 'get_neo4j_driver', lambda: _EmptyFakeDriver())
+        assert client.get('/rest/v1/registry-center/knowledge-graph/nodes').status_code == 200
+        assert client.post('/rest/v1/registry-center/knowledge-graph/nodes', json={}).status_code == 403
+
     def test_rate_limit_returns_429(self, client, monkeypatch):
         from limits import parse as parse_rate_limit
         from limits import storage as limit_storage, strategies as limit_strategies
