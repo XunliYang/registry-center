@@ -17,7 +17,9 @@ import pytest
 from loguru import logger
 
 from agent_registry.persistence.file_storage import FileStorage
-from agent_registry.persistence.precheck import format_storage_error, verify_storage_ready
+from agent_registry.persistence.precheck import (
+    format_storage_error, verify_storage_ready, warn_vector_only_mode,
+)
 from agent_registry.persistence.sqlite_storage import SQLiteStorage
 
 
@@ -86,8 +88,101 @@ def test_verify_storage_ready_exits_on_init_failure(monkeypatch):
     assert excinfo.value.code == 1
 
 
-# ---------- format_storage_error ----------
+# ---------- vector-only mode warning ----------
 
+def test_vector_only_mode_warns_when_approval_is_enabled(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"agent_approval_enabled": "true"})
+
+    warn_vector_only_mode()
+
+    assert "use_vectordb=true replaces the authoritative record store" in loguru_caplog.text
+    assert "agent_approval_enabled=true" in loguru_caplog.text
+
+
+def test_vector_only_mode_warning_is_skipped_when_disabled(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", False)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"owner.isolation.enabled": "true"})
+
+    warn_vector_only_mode()
+
+    assert "use_vectordb" not in loguru_caplog.text
+
+
+def test_vector_only_mode_is_quiet_when_no_feature_needs_the_store(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf", lambda: {})
+
+    warn_vector_only_mode()
+
+    assert "use_vectordb" not in loguru_caplog.text
+
+
+def test_storage_precheck_reports_vector_only_mode_with_isolation(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"owner.isolation.enabled": "true"})
+    monkeypatch.setattr("agent_registry.registry_instance.get_registry",
+                        lambda: _FakeRegistry(None))
+
+    verify_storage_ready()
+
+    assert "cannot read a stored owner back" in loguru_caplog.text
+
+
+def test_strict_storage_refuses_to_start_in_vector_only_mode(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"agent_approval_enabled": "true",
+                                 "startup.strict.storage": "true"})
+    monkeypatch.setattr("agent_registry.registry_instance.get_registry",
+                        lambda: _FakeRegistry(None))
+
+    with pytest.raises(SystemExit) as excinfo:
+        verify_storage_ready()
+
+    assert excinfo.value.code == 1
+    assert "[storage pre-check] FAILED" in loguru_caplog.text
+    assert "startup.strict.storage=true" in loguru_caplog.text
+    assert "agent_approval_enabled=true stores no status to approve on" in loguru_caplog.text
+
+
+def test_strict_storage_refuses_even_without_approval_or_isolation(monkeypatch):
+    """The mode itself is refused, not just the features it breaks."""
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"startup.strict.storage": "true"})
+
+    with pytest.raises(SystemExit) as excinfo:
+        warn_vector_only_mode()
+
+    assert excinfo.value.code == 1
+
+
+def test_strict_storage_is_a_no_op_with_a_record_store(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", False)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"startup.strict.storage": "true"})
+
+    warn_vector_only_mode()
+
+    assert "use_vectordb" not in loguru_caplog.text
+
+
+def test_warning_points_at_the_strict_flag(monkeypatch, loguru_caplog):
+    monkeypatch.setattr("agent_registry.config.USE_VECTORDB", True)
+    monkeypatch.setattr("agent_registry.config.get_conf",
+                        lambda: {"agent_approval_enabled": "true"})
+
+    warn_vector_only_mode()
+
+    assert "503" in loguru_caplog.text
+    assert "startup.strict.storage=true" in loguru_caplog.text
+
+
+# ---------- format_storage_error ----------
 def test_format_storage_error_contains_diagnostics():
     conf = {"mysql.host": "db.internal", "mysql.port": 3306,
             "mysql.name": "rc", "mysql.username": "svc"}

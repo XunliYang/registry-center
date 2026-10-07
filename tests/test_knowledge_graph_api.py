@@ -25,6 +25,20 @@ from unittest.mock import MagicMock, patch
 import json
 
 from agent_registry.server import app
+from agent_registry.knowledge_graph_api import router as kg_router_module
+from common.custom.custom_handle import HandlerRegistry
+from common.custom.interface_type import InterfaceType
+from common.util.authenticate_util import Principal
+from unittest.mock import AsyncMock
+
+
+@pytest.fixture(autouse=True)
+def graph_operator(monkeypatch):
+    """Functional tests opt into the pre-embedded graph API as an operator."""
+    monkeypatch.setattr(kg_router_module, 'get_conf', lambda: {
+        'knowledge_graph.enabled': 'true', 'knowledge_graph.allowed.owners': 'graph-admin'})
+    monkeypatch.setitem(HandlerRegistry._instances, InterfaceType.AUTHENTICATE.value,
+                        MagicMock(handle=AsyncMock(return_value=Principal('127.0.0.1', identity='graph-admin'))))
 
 
 @pytest.fixture
@@ -614,7 +628,39 @@ class TestBulkEndpoints:
 
 class TestImportExportEndpoints:
     """Test import/export endpoints."""
-    
+
+    def test_import_relationship_missing_fields_reports_one_error(self, client, mock_neo4j_driver):
+        """A missing field is reported once, not as a follow-up KeyError."""
+        mock_session = mock_neo4j_driver.session.return_value.__enter__.return_value
+        mock_node_result = MagicMock()
+        mock_node_result.single.return_value = {'id': 'node-1'}
+        mock_session.run.side_effect = [mock_node_result]
+
+        response = client.post("/rest/v1/registry-center/knowledge-graph/import", json={
+            "nodes": [{"labels": ["Person"], "properties": {"name": "张三"}}],
+            "relationships": [{"type": "KNOWS", "endNodeId": "node-2"}],
+        })
+
+        data = response.json()
+        assert data['data']['relationshipsCreated'] == 0
+        rel_errors = [e for e in data['data']['errors'] if e['index'] == 0 and 'startNodeId' in e['message']]
+        assert len(rel_errors) == 1
+        # The node import still succeeded, so this is a partial import.
+        assert response.status_code == 201
+
+    def test_import_without_a_single_created_item_is_unprocessable(self, client, mock_neo4j_driver):
+        """201 would claim the graph changed; a fully failed import must not."""
+        response = client.post("/rest/v1/registry-center/knowledge-graph/import", json={
+            "nodes": [{"properties": {"name": "no labels"}}],
+            "relationships": [],
+        })
+
+        assert response.status_code == 422
+        data = response.json()
+        assert data['success'] is False
+        assert data['data']['nodesCreated'] == 0
+        assert data['data']['errors'][0]['message'] == "Missing labels"
+
     def test_import_graph(self, client, mock_neo4j_driver):
         """Test importing graph data."""
         mock_session = mock_neo4j_driver.session.return_value.__enter__.return_value

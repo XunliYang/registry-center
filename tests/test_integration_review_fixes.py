@@ -34,6 +34,12 @@ from tests.fakes.integration import (
 )
 
 
+@pytest.fixture(autouse=True)
+def authorized_callbacks(monkeypatch):
+    monkeypatch.setattr('agent_registry.broadcast.callback_policy.get_conf', lambda: {
+        'broadcast.callback.allowlist': 'a.b'})
+
+
 class _FakeStore:
     def __init__(self):
         self.items = {}
@@ -183,6 +189,17 @@ class TestBroadcastGate:
         assert resp.status_code == 201
         assert len(self.service.dispatcher.added) == 1
 
+    def test_non_string_callback_url_is_422(self, client):
+        """A non-string callbackUrl is client input: 422, never a 500."""
+        c, stub, reg = client
+        stub.principal = _vendor("vendor_a")
+        stub.principal.role = CallerRole.NMS_OSS
+        resp = c.post("/integration/v1/subscriptions",
+                      json={"callbackUrl": {"url": "https://a.b/c"}}, headers=_auth_headers())
+        assert resp.status_code == 422
+        assert "URL string" in resp.json()["errors"]["error"][0]["errorMessage"]
+        assert self.service.subscription_store.items == {}
+
 
 class TestVendorOwnershipIdentityAnchor:
     """A2: identity is the single ownership anchor; owner is metadata only."""
@@ -207,7 +224,7 @@ class TestVendorOwnershipIdentityAnchor:
         reg._records[("own", "rv_org")] = _FakeRecord(make_agent_card("own", "rv_org"), owner="vendor_a")
         stub.principal = _vendor(identity="vendor_a", owner="vendor_a")
         resp = c.put("/integration/v1/agent-cards/rv_org/own",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "own"}]}, headers=_auth_headers())
         assert resp.status_code == 200
 
     def test_ownerless_card_still_operable(self, client):
@@ -215,7 +232,7 @@ class TestVendorOwnershipIdentityAnchor:
         reg._records[("public", "rv_org")] = _FakeRecord(AGENT_CARD, owner=None)
         stub.principal = _vendor(identity="vendor_a")
         resp = c.put("/integration/v1/agent-cards/rv_org/public",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "public"}]}, headers=_auth_headers())
         assert resp.status_code == 200
 
     def test_registration_binds_identity_not_owner_field(self, client):

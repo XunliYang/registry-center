@@ -29,10 +29,11 @@ import threading
 import time
 
 import uvicorn
-import uvicorn.protocols.http.h11_impl as h11_impl
+from collections import deque
 from loguru import logger
 
 from agent_registry.cipher_converter import CipherConverter
+from agent_registry.identity import install_tls_peer_cert_injection
 from agent_registry.integration.app import integration_app
 from common.util.ssl_config import conf_singleton_obj, load_cert_password
 
@@ -44,14 +45,17 @@ _STARTUP_TIMEOUT_SECONDS = 30
 # Peer-certificate injection.
 #
 # uvicorn does not expose the TLS peer certificate to the ASGI application.
-# RequestResponseCycle owns the request scope; wrap its run_asgi to copy the
-# peer certificate from the connection's SSL object into
-# scope["tls_peer_cert"] before the app runs. The extra scope key is benign
-# for the main port (nothing reads it there).
+# The shared implementation in agent_registry.identity wraps the HTTP cycle so
+# every request scope carries scope["tls_peer_cert"] (and the direct peer
+# address used by owner.identity.mode=trusted_proxy). Installed at import time
+# because the integration server can be started without start.py; the main
+# port uses the same implementation.
 # ---------------------------------------------------------------------------
 import logging as _stdlib_logging
 
-_uvicorn_records: list = []
+install_tls_peer_cert_injection()
+
+_uvicorn_records = deque(maxlen=200)
 
 
 class _UvicornRecordSink(_stdlib_logging.Handler):
@@ -64,23 +68,6 @@ class _UvicornRecordSink(_stdlib_logging.Handler):
 
 _stdlib_logging.getLogger("uvicorn").addHandler(_UvicornRecordSink())
 _stdlib_logging.getLogger("uvicorn.error").addHandler(_UvicornRecordSink())
-
-_cycle_run_asgi = h11_impl.RequestResponseCycle.run_asgi
-
-
-async def _run_asgi_with_peer_cert(self, app):
-    peer_cert = None
-    try:
-        ssl_object = self.transport.get_extra_info('ssl_object') if self.transport else None
-        if ssl_object is not None:
-            peer_cert = ssl_object.getpeercert()
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"Failed to read TLS peer certificate: {e}")
-    self.scope['tls_peer_cert'] = peer_cert
-    return await _cycle_run_asgi(self, app)
-
-
-h11_impl.RequestResponseCycle.run_asgi = _run_asgi_with_peer_cert
 
 
 def _make_ssl_context_factory(conf_obj, require_client_cert: bool):

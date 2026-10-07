@@ -171,8 +171,35 @@ class TestVendorOwnerBinding:
         reg._records[("mine", "tp_org")] = _FakeRecord(make_agent_card("mine", "tp_org"), owner="svc_app")
         stub.principal = _principal(CallerRole.VENDOR_AGENT)
         resp = c.put("/integration/v1/agent-cards/tp_org/mine",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "mine"}]}, headers=_auth_headers())
         assert resp.status_code == 200
+
+    @pytest.mark.parametrize('payload', [{'agentCards': 'text'}, {'agentCards': [False]},
+                                         {'agentCards': [{'unknownField': 1}]}])
+    def test_vendor_malformed_card_is_client_error(self, client, payload):
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.VENDOR_AGENT)
+        response = c.post('/integration/v1/agent-cards', json=payload, headers=_auth_headers())
+        assert response.status_code == 422
+        assert reg._records == {}
+
+    def test_vendor_cannot_rename_card_using_put(self, client):
+        c, stub, reg = client
+        original = make_agent_card('tp_agent', 'tp_org')
+        reg._records[('tp_agent', 'tp_org')] = _FakeRecord(original, owner='svc_app')
+        stub.principal = _principal(CallerRole.VENDOR_AGENT)
+        response = c.put('/integration/v1/agent-cards/tp_org/tp_agent',
+                         json={'agentCards': [{**AGENT_CARD, 'name': 'Renamed'}]}, headers=_auth_headers())
+        assert response.status_code == 422
+        assert reg._records[('tp_agent', 'tp_org')].agent_card == original
+
+    @pytest.mark.parametrize('top_n', [True, False, 1.5, '10', 0, 51, None])
+    def test_semantic_query_rejects_coercion_and_clamping(self, client, top_n):
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.PARTNER_SERVICE)
+        response = c.post('/integration/v1/agent-cards/semantic-query',
+                          json={'task': 'diagnostics', 'topN': top_n}, headers=_auth_headers())
+        assert response.status_code == 422
 
     def test_semantic_query_topn_validation(self, client):
         """topN must be an integer within bounds (422 otherwise, no 500)."""
@@ -185,13 +212,72 @@ class TestVendorOwnerBinding:
                       json={"task": "x", "topN": "abc"}, headers=_auth_headers())
         assert resp.status_code == 422
 
+    def test_semantic_query_malformed_body_is_422(self, client):
+        """A malformed or non-object body is client input, never a 500."""
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.PARTNER_SERVICE)
+        for body in (b"", b"{not json", b"[]", b"null"):
+            resp = c.post("/integration/v1/agent-cards/semantic-query", content=body,
+                          headers={**_auth_headers(), "content-type": "application/json"})
+            assert resp.status_code == 422, body
+
     def test_nms_can_update_foreign_card(self, client):
         c, stub, reg = client
         reg._records[("foreign", "org")] = _FakeRecord(AGENT_CARD, owner="someone_else")
         stub.principal = _principal(CallerRole.NMS_OSS)
         resp = c.put("/integration/v1/agent-cards/org/foreign",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "foreign",
+                                           "provider": {**AGENT_CARD["provider"], "organization": "org"}}]},
+                     headers=_auth_headers())
         assert resp.status_code == 200
+
+
+class TestVisibilityRuleIsSharedWithTheMainPort:
+    """The integration port must not keep a second copy of the visibility rule.
+
+    It previously compared the status string inline and dropped the health-based
+    hiding into the same branch, so any change to `_is_discoverable()` (the main
+    port's single rule) would silently diverge here.
+    """
+
+    def test_query_calls_the_shared_predicate(self, client, monkeypatch):
+        c, stub, reg = client
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(make_agent_card("tp_agent", "tp_org"))
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+        seen = []
+
+        def spy(name, organization, registry):
+            seen.append((name, organization))
+            return True
+
+        monkeypatch.setattr(app_module, "_is_discoverable", spy)
+        resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
+        assert resp.status_code == 200
+        assert len(resp.json()["agentCards"]) == 1
+        assert seen == [("tp_agent", "tp_org")]
+
+    def test_get_by_key_calls_the_shared_predicate(self, client, monkeypatch):
+        c, stub, reg = client
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(make_agent_card("tp_agent", "tp_org"))
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+        monkeypatch.setattr(app_module, "_is_discoverable", lambda n, o, r: False)
+
+        resp = c.get("/integration/v1/agent-cards/tp_org/tp_agent", headers=_auth_headers())
+
+        assert resp.status_code == 200
+        assert resp.json()["agentCards"] == []
+
+    def test_pending_card_is_hidden_on_both_endpoints(self, client):
+        c, stub, reg = client
+        card = make_agent_card("tp_agent", "tp_org")
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(card, status="registered")
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+
+        listed = c.get("/integration/v1/agent-cards", headers=_auth_headers())
+        exact = c.get("/integration/v1/agent-cards/tp_org/tp_agent", headers=_auth_headers())
+
+        assert listed.json()["agentCards"] == []
+        assert exact.json()["agentCards"] == []
 
 
 class TestRegistrationOwnership:

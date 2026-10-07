@@ -27,6 +27,7 @@ from loguru import logger
 
 from agent_registry.config import PERSISTENCE_METADATA_FILE, PERSISTENCE_TAGS_FILE
 from agent_registry.model.tag import Tag
+from agent_registry.status import is_discoverable_status
 from .base import StorageBackend, AgentRecord
 
 
@@ -107,13 +108,20 @@ class FileStorage(StorageBackend):
                 result.append(agent)
         return result
 
-    def find_all(self) -> List[AgentCard]:
+    def find_all(self, status: Optional[str] = None) -> List[AgentCard]:
+        if status is not None:
+            return self.find_by_status(status)
         return list(self._agents.values())
 
     def find_by_status(self, status: str) -> List[AgentCard]:
         result = []
         for key, agent in self._agents.items():
-            if key in self._status_map and self._status_map[key] == status:
+            stored_status = self._status_map.get(key)
+            if stored_status == status:
+                result.append(agent)
+            elif stored_status is None and is_discoverable_status(status):
+                # Records written before status tracking have no entry; they were
+                # always served as published, so a published filter must keep them.
                 result.append(agent)
         return result
 

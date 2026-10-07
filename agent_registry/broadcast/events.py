@@ -69,6 +69,19 @@ def build_sync_required(since_version: int) -> RegistryEvent:
     return build_event(EventType.SYNC_REQUIRED, {"since_version": since_version}, since_version)
 
 
+def public_event(event: RegistryEvent) -> RegistryEvent:
+    """Quarantine old log payloads whose approval visibility was not recorded.
+
+    Preserve the cursor/envelope, but require a published-card snapshot instead
+    of replaying a possibly pending Card from a pre-policy outbox.
+    """
+    if event.event_type == EventType.SYNC_REQUIRED or event.data.get('discovery_public') is True:
+        return event
+    return RegistryEvent(event.event_id, EventType.SYNC_REQUIRED, event.timestamp,
+                         event.registry_version, {'since_version': 0, 'requires_snapshot': True,
+                                                  'reason': 'legacy_visibility_unknown'})
+
+
 def merge_events(previous: RegistryEvent, incoming: RegistryEvent) -> RegistryEvent:
     """
     Debounce coalescing for two buffered events of the same agent:

@@ -26,15 +26,20 @@ class TestInitCommand(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.config_file = os.path.join(self.temp_dir, "server.conf")
+        # init_command() also saves the persistence config; keep it out of the
+        # repository's tracked etc/conf/persistence.conf (test isolation).
+        self.persistence_config_file = os.path.join(self.temp_dir, "persistence.conf")
 
     def tearDown(self):
-        if os.path.exists(self.config_file):
-            os.remove(self.config_file)
+        for path in (self.config_file, self.persistence_config_file):
+            if os.path.exists(path):
+                os.remove(path)
         os.rmdir(self.temp_dir)
 
     def _create_init_command(self):
         init_cmd = InitCommand()
         init_cmd.config_file = self.config_file
+        init_cmd.persistence_config_file = self.persistence_config_file
         init_cmd.existing_config = {}
         return init_cmd
 
@@ -43,6 +48,7 @@ class TestInitCommand(unittest.TestCase):
             f.write(config_content)
         init_cmd = InitCommand()
         init_cmd.config_file = self.config_file
+        init_cmd.persistence_config_file = self.persistence_config_file
         init_cmd.existing_config = init_cmd._parse_config_file(init_cmd.config_file)
         return init_cmd
 

@@ -17,12 +17,13 @@
 import json
 import base64
 import asyncio
+import copy
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
 from common.util.app_config import get_conf
 from a2a.types import AgentCard
-from a2a.utils.signing import create_signature_verifier, InvalidSignaturesError, NoSignatureError
+from a2a.utils.signing import create_signature_verifier
 from google.protobuf.json_format import MessageToDict
 
 from agent_registry.signature.models import SignatureObject, ProtectedHeader
@@ -75,90 +76,76 @@ class AgentCardSignatureValidator:
         Returns:
             ValidationResult: Validation result.
         """
+        # Synchronous callers retain local-key validation. Network verification
+        # on an event loop must use the async API; do not nest asyncio.run().
+        result = self._validate_backend(agent_card)
+        if result is not None:
+            return result
         try:
-            if not self._signature_validation_enabled:
-                logger.info("Signature validation is disabled, skipping validation")
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._validate_jku(agent_card))
+        raise RuntimeError("Use await validate_agent_card_async() on an event loop")
+
+    async def validate_agent_card_async(self, agent_card: AgentCard) -> ValidationResult:
+        """Validate any trusted signature, awaiting JKU retrieval when needed."""
+        result = self._validate_backend(agent_card)
+        return result if result is not None else await self._validate_jku(agent_card)
+
+    def _validate_backend(self, agent_card: AgentCard) -> Optional[ValidationResult]:
+        if not self._signature_validation_enabled:
+            return ValidationResult(is_valid=True)
+        if not self._extract_signatures_from_protobuf(agent_card):
+            return ValidationResult(
+                is_valid=False, error_code="SIG001",
+                error_message="Signatures field is required when signature validation is enabled")
+        fetch_key = self.jwk_fetcher.create_backend_key_fetcher(
+            agent_card.provider.organization, agent_card.name, agent_card.provider.url)
+        for signature in agent_card.signatures:
+            header = self._decode_protected(signature.protected)
+            if header is None:
+                continue
+            key = fetch_key(header.kid, "")
+            if key is not None and self._verify_one(agent_card, signature, key):
                 return ValidationResult(is_valid=True)
+        return None
 
-            organization = agent_card.provider.organization
-            agent_name = agent_card.name
-            provider_url = agent_card.provider.url
-
-            signatures = self._extract_signatures_from_protobuf(agent_card)
-            if not signatures:
-                return ValidationResult(
-                    is_valid=False,
-                    error_code="SIG001",
-                    error_message="Signatures field is required when signature validation is enabled",
-                    details={
-                        "validation_enabled": True,
-                        "signatures_found": False
-                    }
-                )
-
-            for sig_obj in signatures:
-                protected_header = self._decode_protected(sig_obj.protected)
-                if not protected_header:
-                    logger.warning(f"Failed to decode protected header: {sig_obj.protected}")
-                    continue
-
-                kid = protected_header.kid
-
-                backend_key_fetcher = self.jwk_fetcher.create_backend_key_fetcher(organization, agent_name, provider_url)
-                backend_key = backend_key_fetcher(kid, "")
-
-                if backend_key:
-                    logger.info(f"Using backend key for kid: {kid}")
-                    verifier = create_signature_verifier(backend_key_fetcher, ['ES256', 'RS256'])
-                    try:
-                        verifier(agent_card)
-                        logger.info(f"Signature validation passed with backend key: {kid}")
-                        return ValidationResult(is_valid=True)
-                    except (NoSignatureError, InvalidSignaturesError) as e:
-                        logger.warning(f"Backend key signature validation failed: {e}")
-                    except TypeError as e:
-                        logger.warning(f"Backend key fetcher returned None: {e}")
-                    except Exception as e:
-                        logger.warning(f"Unexpected backend signature validation error: {e}")
-
-            logger.info("Trying jku key signature.")
-            jku_key_fetcher = lambda key_id, jku: asyncio.run(
-                self.jwk_fetcher.fetch_jku_key(key_id, jku)
-            )
-            verifier = create_signature_verifier(jku_key_fetcher, ['ES256', 'RS256'])
+    async def _validate_jku(self, agent_card: AgentCard) -> ValidationResult:
+        # A missing/bad first key must not abort checking a valid later one.
+        # Cache per validation so repeated signatures cannot multiply fetches.
+        keys = {}
+        for signature in agent_card.signatures:
+            header = self._decode_protected(signature.protected)
+            if header is None or not header.jku:
+                continue
+            key_id = (header.kid, header.jku)
             try:
-                verifier(agent_card)
-                logger.info("Signature validation passed with jku key.")
-                return ValidationResult(is_valid=True)
-            except NoSignatureError as e:
-                logger.error(f"No valid signature found: {e}")
-            except InvalidSignaturesError as e:
-                logger.error(f"JKU signature validation failed: {e}")
-            except TypeError as e:
-                logger.error(f"Failed to fetch signature key from JKU URL: {e}")
+                if key_id not in keys:
+                    keys[key_id] = await self.jwk_fetcher.fetch_jku_key(*key_id)
+                key = keys[key_id]
+                if key is not None and self._verify_one(agent_card, signature, key):
+                    return ValidationResult(is_valid=True)
             except Exception as e:
-                logger.error(f"Unexpected error during JKU signature validation: {e}")
+                logger.warning("JKU signature verification failed: {}", type(e).__name__)
+        return ValidationResult(
+            is_valid=False, error_code="SIG005",
+            error_message="Signature validation failed: no valid signature with a trusted key",
+            details={"total_signatures": len(agent_card.signatures)})
 
-            logger.error("All signature validations failed")
-            return ValidationResult(
-                is_valid=False,
-                error_code="SIG005",
-                error_message="Signature validation failed: unable to verify signature with provided keys. Please ensure backend public key is configured or JKU URL is accessible.",
-                details={
-                    "total_signatures": len(signatures),
-                    "backend_key_checked": True,
-                    "jku_key_checked": True
-                }
-            )
-
+    @staticmethod
+    def _verify_one(agent_card: AgentCard, signature, key) -> bool:
+        # A2A canonicalization excludes signatures. Verify one signature on a
+        # copy so malformed earlier headers and missing keys cannot abort its
+        # any-valid-signature policy. Keep the submitted card unchanged.
+        candidate = copy.deepcopy(agent_card)
+        del candidate.signatures[:]
+        candidate.signatures.append(signature)
+        try:
+            create_signature_verifier(lambda kid, jku: key, ['ES256', 'RS256'])(candidate)
+            return True
         except Exception as e:
-            logger.error(f"Signature validation internal error: {e}")
-            return ValidationResult(
-                is_valid=False,
-                error_code="SIG999",
-                error_message=f"Signature validation internal error: {str(e)}",
-                details={"error": str(e)}
-            )
+            logger.debug("Signature verification failed: {}", type(e).__name__)
+            return False
 
     @staticmethod
     def _extract_signatures_from_protobuf(agent_card: AgentCard) -> List[SignatureObject]:

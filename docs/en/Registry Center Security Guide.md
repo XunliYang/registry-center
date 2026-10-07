@@ -108,16 +108,38 @@ Provides an authentication callback function for on-demand custom implementation
 
 ### AgentCard Operation Isolation
 
-When the Registry Center has HTTPS communication enabled and client certificate verification enabled, the AgentCard operation isolation feature is enabled by default and can be disabled.<br>
-The Registry Center uses the CN field of the client TLS identity certificate as the operator identity, and the operator of the AgentCard registration REST interface as the agent owner.<br>
-In the AgentCard modification and deletion REST interfaces, the system checks whether the operator is the agent owner, and only allows the agent owner to modify or delete the AgentCard.<br>
+Set `owner.isolation.enabled=true` to enforce ownership. In the default
+`owner.identity.mode=certificate` mode, the owner is the CN obtained from the
+TLS connection's verified peer certificate. A client-supplied
+`X-SSL-Client-DN` header does not establish identity. An explicitly configured
+`trusted_proxy` mode may use a proxy-written header only when the actual TCP
+peer belongs to `owner.trusted.proxy.ips`; the proxy must strip external identity
+headers, and the application port must only be reachable through that proxy.
 
-Configuration scenarios where operation isolation is not enabled:<br>
-- HTTP communication, or HTTPS communication without client certificate verification;<br>
-- HTTPS communication with client certificate verification enabled, but the operation isolation switch is turned off (owner.isolation.enabled is configured as false).<br>
-- HTTPS communication with client certificate verification enabled, the operation isolation switch is turned on, the validation mode is relaxed (owner.validation.mode=relaxed), and the operator identity was empty during AgentCard registration.<br>
-<br>
-In these scenarios, operation isolation is not enforced, and all clients can perform modification and deletion operations on any AgentCard. This mechanism is only suitable for interactions within a trusted domain; otherwise, there is a risk of AgentCard tampering.<br>
+Registration requires a verified identity in `owner.validation.mode=strict`
+(the default); `relaxed` keeps the pre-existing behaviour of accepting an
+anonymous registration, which produces a card with no owner. In other words,
+`relaxed` does not require an identity, so keep `strict` (or accept ownerless
+cards deliberately) when isolation is enabled. Updates/deletes require the same
+identity as the stored owner; missing/invalid identity returns 401, ownership
+mismatch returns 403, and legacy cards with no owner require administrative
+assignment before isolated writes are permitted. Heartbeat reporting is covered by
+the same rule: a heartbeat claims that *this* card is alive (it drives health
+hiding, the offline TTL and public health events), so with isolation enabled only
+the stored owner may report one — a monitor that heartbeats on behalf of Agents
+needs its own credential per owner, or must run with isolation disabled. Turning
+listener HTTPS off does not implicitly disable ownership or AgentCard signature
+verification.
+
+If `owner.isolation.enabled=false`, ownership checks are disabled. Use this
+only in controlled development or with a separately enforced authorization
+policy. See the [upgrade notes](./Registry%20Center%20Upgrade%20Notes.md).
+
+An isolation configuration that cannot verify callers still lets the service start
+(it logs a warning and rejects ownership writes with 401). Set
+`startup.strict.identity=true` to fail closed instead: startup aborts before any
+port is bound when `verify_client=false` in `certificate` mode,
+`owner.trusted.proxy.ips` is empty in `trusted_proxy` mode, or the mode is `none`.
 ```properties
 # server.conf configuration file
 
@@ -125,9 +147,14 @@ In these scenarios, operation isolation is not enforced, and all clients can per
 owner.isolation.enabled=true
 
 # Owner validation mode
-# strict: Strict mode, CN cannot be empty. If CN is empty, the registration request will be rejected
-# relaxed: Relaxed mode, CN can be empty. If CN is empty, operation isolation is not enforced
-owner.validation.mode=relaxed
+# strict: Validate CN format; verified identity is always required
+# relaxed: Accept other non-empty CN formats from verified credentials
+owner.validation.mode=strict
+owner.identity.mode=certificate
+# Used only in trusted_proxy mode; never use a wildcard
+owner.trusted.proxy.ips=
+# true: refuse to start when the identity configuration above cannot verify callers
+startup.strict.identity=false
 ```
 
 ## Storage Security
@@ -354,7 +381,7 @@ When the change broadcast capability is enabled (`broadcast.enabled=true`), the 
 
 ### Callback URL SSRF Protection
 
-Subscription callback URLs are HTTPS-only by default; HTTP can be allowed only in development environments via `broadcast.allow.http.callbacks=true`. After `broadcast.callback.allowlist` (comma-separated domain names) is configured, only allowlisted callback hosts are accepted, preventing the Registry Center from being tricked into sending requests to internal network addresses.
+Subscription callback URLs are HTTPS-only by default; HTTP can be allowed only in development environments via `broadcast.allow.http.callbacks=true`. `broadcast.callback.allowlist` (comma-separated domain names) is **mandatory**: it must be non-empty before subscriptions can be created, and every delivery re-validates the destination against it, preventing the Registry Center from being tricked into sending requests to internal network addresses. Leaving it empty fails closed — creating a subscription returns 422 and no delivery is attempted.
 
 ### Webhook Message Signature Verification
 

@@ -64,6 +64,11 @@ TAG_MAX_LENGTH = "tag.max.length"
 
 OWNER_ISOLATION_ENABLED = str(get_conf().get("owner.isolation.enabled", "false")).lower() == 'true'
 OWNER_VALIDATION_MODE = get_conf().get("owner.validation.mode", "strict")
+# Identity source for ownership enforcement: certificate | trusted_proxy | none.
+# A bare X-SSL-Client-DN header is only honoured in trusted_proxy mode, and only
+# for connections whose direct peer is listed in owner.trusted.proxy.ips.
+OWNER_IDENTITY_MODE = "owner.identity.mode"
+OWNER_TRUSTED_PROXY_IPS = "owner.trusted.proxy.ips"
 
 # ---------- Heartbeat detection ----------
 # Keys use dot-separated names so REGISTRY_* env overrides map cleanly.

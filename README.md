@@ -49,19 +49,27 @@ The Registry Center provides unified lifecycle management for **AgentCards** —
 | Category | Capability |
 |----------|------------|
 | **AgentCard CRUD** | Register, query (by name/organization), update, and deregister agent descriptions |
-| **Semantic Search** | Natural-language task matching via LLM + optional vector DB (Milvus) |
+| **Semantic Search** | Natural-language task matching over published AgentCards via LLM; model failures return 503. Legacy Milvus mode remains experimental and does not provide SQL-backed approval/ownership parity: those endpoints answer 503 instead of empty results |
 | **Agent Approval** | Optional manual review workflow — agents start as `registered`, admins promote to `published` |
 | **Tag Management** | Independent tag entities with full CRUD, assignable to agents |
 | **TLS Security** | TLS 1.2/1.3 with strong cipher suites, mutual TLS client certificate verification |
 | **Signature Verification** | JWS-based AgentCard integrity checks (RS256, ES256), static JWK or dynamic `jku` lookup. `jku` lookup is gated by an operator-configured host allowlist (`jwk_allowlist` in `etc/conf/server.conf`, or `REGISTRY_JWK_ALLOWLIST`); with no allowlist configured the `jku` path is disabled (fail closed) and only backend keys are used |
-| **Owner Isolation** | Per-agent ownership via TLS client certificate CN, strict or relaxed mode |
+| **Owner Isolation** | Ownership from verified TLS client certificates or an explicitly trusted proxy; ownerless legacy cards require administrative ownership assignment |
 | **Content Safety** | Prompt injection and high-risk skill blacklist filtering on registration |
 | **Rate Limiting** | Per-endpoint rate limits (configurable: 50–100 req/s, JWK endpoint: 10 req/s) with moving-window algorithm |
 | **Heartbeat Detection** | Agents periodically report liveness; configurable failure threshold and grace period to identify offline agents promptly |
-| **Change Broadcast** | Registry changes pushed to subscribers via webhooks (HMAC signing, debouncing, rate limiting, outbox persistence) with version-based reconciliation |
+| **Change Broadcast** | Best-effort webhooks to operator-allowlisted destinations, with HMAC signing and version-based reconciliation; version allocation is commit-ordered in the SQL persistence modes (deployment stays single-instance) and delivery state is tracked per subscriber, while retry-after-failure and exactly-once semantics are not yet guaranteed |
 | **Audit Logging** | Rotating JSON audit log (time, client IP, user, operation, object, result) |
 | **CLI Administration** | Interactive CLI for agent approval, tag management, and full agent listing |
 | **Custom Extensions** | Pluggable handlers (auth, audit, decrypt, storage) and LLM providers |
+
+See [upgrade and deployment notes](docs/en/Registry%20Center%20Upgrade%20Notes.md)
+([中文](docs/zh/注册中心升级与部署说明.md)) for identity configuration, approval
+visibility, legacy-event synchronization, and container probe setup. The generic
+knowledge-graph API is pre-embedded and disabled by default; enabling it requires
+an authenticated operator and separate graph permissions. `docker-compose.yml`
+is a loopback-only development example with client authentication disabled;
+it is not a production access-policy template.
 
 ## Quick Start
 

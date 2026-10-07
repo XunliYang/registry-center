@@ -27,7 +27,9 @@ class EventBus:
     def __init__(self, outbox: OutboxStore, dispatch_enabled: bool = False):
         self._outbox = outbox
         self._dispatch_enabled = dispatch_enabled
-        self._queue: "queue.Queue[RegistryEvent]" = queue.Queue()
+        # A bounded wake-up cache; the outbox, not this queue, owns the events.
+        self._queue: "queue.Queue[RegistryEvent]" = queue.Queue(maxsize=1024)
+        self._overflowed = False
         self._dispatcher = None
         self._consumer_task: Optional[asyncio.Task] = None
         self._listeners: List = []
@@ -76,7 +78,10 @@ class EventBus:
     def notify(self, event: RegistryEvent) -> None:
         """Wake cross-thread/cross-process consumers for an already persisted event."""
         if self._dispatch_enabled and self._dispatcher is not None:
-            self._queue.put_nowait(event)
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
+                self._overflowed = True  # Coalesce hints, never drop the durable fact.
         for listener in list(self._listeners):
             try:
                 listener(event)
@@ -94,7 +99,9 @@ class EventBus:
         try:
             while True:
                 forwarded = False
-                while True:
+                # Also bound work per loop turn: a continuously refilled queue
+                # must not starve HTTP handlers, heartbeats or delivery workers.
+                for _ in range(256):
                     try:
                         event = self._queue.get_nowait()
                     except queue.Empty:
@@ -108,6 +115,13 @@ class EventBus:
                     await asyncio.sleep(poll_interval)
                 else:
                     await asyncio.sleep(0)
+                if self._overflowed:
+                    self._overflowed = False
+                    try:
+                        self._dispatcher.recover()
+                    except Exception as exc:
+                        logger.error('Overflow recovery failed: {}', type(exc).__name__)
+                        self._overflowed = True
         except asyncio.CancelledError:
             logger.info("Event bus consumer stopped")
             raise

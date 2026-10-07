@@ -13,6 +13,9 @@ from common.custom.interface_type import InterfaceType
 
 class ListAgentsHandler(BaseUDSHandler):
     def handle(self, params: Dict[str, Any], registry, config) -> Dict[str, Any]:
+        # Administration needs approval/ownership metadata even when the index
+        # currently has no candidates. Fail before querying the optional index.
+        registry.require_authoritative_store('listing agents')
         query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
         agents = asyncio.run(query_handle.handle(None, None))
 

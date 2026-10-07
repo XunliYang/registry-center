@@ -31,7 +31,7 @@ from agent_registry.health.state import HealthStatus, compute_status
 from agent_registry.health.store import MemoryHeartbeatStore
 from agent_registry.health.sweeper import HealthSweeper
 from agent_registry.persistence.base import AgentRecord
-from agent_registry.server import app, get_registry
+from agent_registry.server import _enqueue_drop_oldest, app, get_registry
 
 
 T0 = datetime(2026, 9, 17, 12, 0, 0, tzinfo=timezone.utc)
@@ -44,6 +44,12 @@ HEALTH_CONFIG = {
     "heartbeat.offline.ttl": "0",
 }
 BROADCAST_CONFIG = {"broadcast.enabled": "true"}
+
+
+@pytest.fixture(autouse=True)
+def authorized_callbacks(monkeypatch):
+    monkeypatch.setattr('agent_registry.broadcast.callback_policy.get_conf', lambda: {
+        'broadcast.callback.allowlist': 'cb.example.com,operator.example.com'})
 
 
 def _make_agent_record(name="TestAgent", org="TestOrg"):
@@ -161,6 +167,13 @@ class TestSweeper:
         registry.get_by_key_with_owner.return_value = None
         sweeper.sweep_once(T0 + timedelta(seconds=120))
         assert service.list_monitored() == []
+
+    def test_pending_agent_health_transition_is_not_public(self):
+        service, outbox, registry, sweeper = self._build()
+        registry.get_by_key_with_owner.return_value.status = 'registered'
+        sweeper.sweep_once(T0 + timedelta(seconds=120))
+        assert service.status_of('agentA', 'orgA') == 'offline'
+        assert outbox.max_version() == 0
 
     def test_offline_ttl_triggers_deregistration(self):
         _, _, registry, sweeper = self._build(offline_ttl=60)
@@ -289,22 +302,23 @@ class TestDispatcherDelivery:
         await dispatcher.stop()
 
     @pytest.mark.asyncio
-    async def test_debounce_coalesces_register_and_update(self):
+    async def test_debounce_batches_without_discarding_durable_event_ids(self):
         store = MemorySubscriptionStore()
         created = store.create(Subscription("", "https://cb.example.com/hook"))
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
-        dispatcher = WebhookDispatcher(store, MemoryOutbox(), client=client,
+        outbox = MemoryOutbox()
+        dispatcher = WebhookDispatcher(store, outbox, client=client,
                                        debounce_window=0.01, max_events_per_second=1000.0)
         dispatcher.add_subscription(created)
-        e1 = build_event(EventType.AGENT_REGISTERED, {"name": "a", "organization": "acme"}, 1)
-        e2 = build_event(EventType.AGENT_UPDATED, {"name": "a", "organization": "acme"}, 2)
+        e1 = outbox.append(build_event(EventType.AGENT_REGISTERED, {"name": "a", "organization": "acme"}, 1))
+        e2 = outbox.append(build_event(EventType.AGENT_UPDATED, {"name": "a", "organization": "acme"}, 2))
         dispatcher.submit(e1)
         dispatcher.submit(e2)
         dispatcher._flush_buffers()
         batch = dispatcher._workers[created.subscription_id].queue.get_nowait()
-        assert len(batch) == 1
-        assert batch[0].event_type is EventType.AGENT_UPDATED
-        assert batch[0].registry_version == 2
+        assert [event.registry_version for event in batch] == [1, 2]
+        assert [event.event_type for event in batch] == [EventType.AGENT_REGISTERED,
+                                                       EventType.AGENT_UPDATED]
         await dispatcher.stop()
 
 
@@ -330,11 +344,22 @@ def _override_registry():
     mock_registry = MagicMock()
     mock_registry.get_by_key_with_owner.return_value = _make_agent_record()
     mock_registry.get_agent_tags.return_value = []
+    mock_registry.get_status.return_value = 'published'
     app.dependency_overrides[get_registry] = lambda: mock_registry
     return mock_registry
 
 
 class TestHeartbeatEndpoint:
+    @pytest.fixture(autouse=True)
+    def heartbeat_ownership_off(self, monkeypatch):
+        """Pin owner isolation off: these cases cover health tracking.
+
+        The heartbeat endpoint enforces ownership when isolation is enabled (see
+        tests/test_owner_identity.py), and the ambient etc/conf/server.conf may
+        have it on — without this pin the suite would depend on local config.
+        """
+        monkeypatch.setattr('agent_registry.server.OWNER_ISOLATION_ENABLED', False)
+
     def test_first_heartbeat_returns_config_and_no_event(self, monkeypatch, auth_mock):
         _, broadcast_service = _install_services(monkeypatch)
         _override_registry()
@@ -536,7 +561,7 @@ class TestHealthStreamEndpoint:
         from agent_registry.server import stream_agent_health
 
         _, broadcast_service = _install_services(monkeypatch)
-        _override_registry()
+        registry = _override_registry()
         monkeypatch.setattr(
             "common.custom.custom_handle.HandlerRegistry.get_handler", lambda t: auth_mock)
 
@@ -550,7 +575,7 @@ class TestHealthStreamEndpoint:
             return {"type": "http.request", "body": b"", "more_body": False}
 
         request = StarletteRequest(scope, receive=receive)
-        response = await stream_agent_health(request, _=None)
+        response = await stream_agent_health(request, registry=registry, _=None)
         assert response.media_type == "text/event-stream"
 
         frames = []
@@ -576,3 +601,44 @@ class TestHealthStreamEndpoint:
         payload = json.loads(data_line[len("data: "):])
         assert payload["event_type"] == "AGENT_HEALTH_CHANGED"
         assert payload["data"]["health_status"] == "offline"
+
+
+def test_stream_queue_accepts_events_while_it_has_room():
+    queue = asyncio.Queue(maxsize=2)
+
+    _enqueue_drop_oldest(queue, "only")
+
+    assert queue.get_nowait() == "only"
+
+
+def test_stream_queue_drops_the_oldest_event_when_full():
+    """A slow SSE consumer must not raise QueueFull inside the loop callback."""
+    queue = asyncio.Queue(maxsize=2)
+
+    for seq in range(5):
+        _enqueue_drop_oldest(queue, seq)
+
+    assert queue.qsize() == 2
+    assert [queue.get_nowait(), queue.get_nowait()] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_invalid_destination_url_fails_fast_without_retries():
+    """httpx.InvalidURL is not an HTTPError/OSError/ValueError (verified), so it
+    must be handled explicitly instead of escaping the batch worker."""
+    attempts = []
+
+    class RejectingClient:
+        async def post(self, url, **kwargs):
+            attempts.append(url)
+            raise httpx.InvalidURL("Port out of range 0-65535")
+
+    store = MemorySubscriptionStore()
+    created = store.create(Subscription("", "https://cb.example.com/hook"))
+    dispatcher = WebhookDispatcher(store, MemoryOutbox(), client=RejectingClient(),
+                                   max_retries=2, backoff_base=0.01, backoff_max=0.02,
+                                   webhook_timeout=1.0)
+    event = build_event(EventType.AGENT_UPDATED, {"name": "a"}, 1)
+
+    assert await dispatcher._deliver_events(created, [event], persist=False) is False
+    assert len(attempts) == 1

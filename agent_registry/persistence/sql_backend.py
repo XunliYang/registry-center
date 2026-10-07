@@ -37,6 +37,9 @@ class SqlStorageBackend(StorageBackend):
     shares_single_connection = False
     # Parameter placeholder for dialect-agnostic helper queries (%s for psycopg2).
     param_ph = "%s"
+    # Dialect name for auxiliary SQL stores that need dialect-specific SQL
+    # (e.g. the outbox version counter: MySQL has no UPDATE ... RETURNING).
+    dialect = "sql"
     # Whether the dialect supports `CREATE INDEX IF NOT EXISTS`. Backends that
     # don't (e.g. MySQL) set this to False; auxiliary SQL stores use it to pick
     # a duplicate-tolerant plain CREATE INDEX instead.
@@ -404,7 +407,9 @@ class SqlStorageBackend(StorageBackend):
         logger.debug(f"Found {len(result)} agents by organization '{organization}'")
         return result
 
-    def find_all(self) -> List[AgentCard]:
+    def find_all(self, status: Optional[str] = None) -> List[AgentCard]:
+        if status is not None:
+            return self.find_by_status(status)
         rows = self._execute_read_all(self.queries.FIND_ALL.value)
         result = [self._row_to_agent(r) for r in rows]
         logger.debug(f"Found {len(result)} agents (find_all)")
@@ -433,9 +438,15 @@ class SqlStorageBackend(StorageBackend):
 
     def update(self, name: str, organization: str, agent_data: Dict[str, Any],
                owner: Optional[str] = None) -> bool:
+        existing = self.find_by_key(name, organization)
+        if existing is None:
+            return False
         agent = Parse(json.dumps(agent_data), AgentCard())
+        if agent.name != name or agent.provider.organization != organization:
+            raise ValueError('Cannot change primary key(name or organization) during update.')
         agent_dict = MessageToDict(agent, preserving_proto_field_name=True)
-        status_value = agent_data.get('status', 'published')
+        # Card edits are not approval operations; preserve governance state.
+        status_value = existing.status or 'published'
         now = datetime.now(timezone.utc)
 
         if owner is not None:
@@ -444,7 +455,6 @@ class SqlStorageBackend(StorageBackend):
                 (json.dumps(agent_dict), status_value, now, name, organization, owner)
             )
         else:
-            existing = self.find_by_key(name, organization)
             if existing and existing.owner:
                 affected = self._execute_write(
                     self.queries.UPDATE_AGENT_WITH_OWNER.value,

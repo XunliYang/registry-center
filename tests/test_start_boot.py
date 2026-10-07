@@ -515,3 +515,21 @@ class TestMainFailurePaths:
         assert (signal.SIGINT, start._handle_shutdown_signal) in fake_signal.registered
         assert (signal.SIGTERM, start._handle_shutdown_signal) in fake_signal.registered
         assert recorded["stops"] == 1
+
+
+class TestForwardedAllowIps:
+    """uvicorn compares trusted-proxy entries literally, so quotes must go."""
+
+    def test_quoted_single_proxy_is_unquoted(self):
+        assert start._forwarded_allow_ips({'forwarded_allow_ips': '"127.0.0.1"'}) == '127.0.0.1'
+
+    def test_single_quotes_and_whitespace_are_removed_per_entry(self):
+        assert start._forwarded_allow_ips(
+            {'forwarded_allow_ips': " '10.0.0.5' , \"10.0.0.6\" "}) == '10.0.0.5,10.0.0.6'
+
+    def test_unquoted_list_is_preserved(self):
+        assert start._forwarded_allow_ips({'forwarded_allow_ips': '127.0.0.1,::1'}) == '127.0.0.1,::1'
+
+    def test_missing_or_empty_value_trusts_no_proxy(self):
+        assert start._forwarded_allow_ips({}) == ''
+        assert start._forwarded_allow_ips({'forwarded_allow_ips': '""'}) == ''

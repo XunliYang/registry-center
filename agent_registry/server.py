@@ -21,7 +21,7 @@ Agent Registry Service - RESTful API for managing AI Agent cards.
 
 This module provides a FastAPI application with endpoints for registering
 and querying agents. It includes rate limiting, request size checks,
-and persistence using a JSON file.
+and pluggable file or SQL persistence.
 """
 
 import asyncio
@@ -39,7 +39,6 @@ from starlette.responses import StreamingResponse
 from google.protobuf.json_format import Parse, MessageToDict
 from loguru import logger
 from limits import strategies, storage, parse_many
-from urllib.parse import urlparse
 
 from starlette.responses import Response
 
@@ -52,17 +51,25 @@ from agent_registry.config import (
     FLOW_CTL_PARALLEL_DEREGISTER, FLOW_CTL_UPDATE, FLOW_CTL_GET, FLOW_CTL_RETRIEVE, FLOW_CTL_DEREGISTER,
     FLOW_CTL_JWK, FLOW_CTL_PARALLEL_JWK, OWNER_ISOLATION_ENABLED, OWNER_VALIDATION_MODE,
     FLOW_CTL_HEARTBEAT, FLOW_CTL_PARALLEL_HEARTBEAT, FLOW_CTL_SUBSCRIPTION, FLOW_CTL_PARALLEL_SUBSCRIPTION,
-    BROADCAST_ALLOW_HTTP_CALLBACKS, BROADCAST_CALLBACK_ALLOWLIST,
 )
 from contextlib import asynccontextmanager
 
-from agent_registry.core import RegistryCore, make_agent_key
+from agent_registry.core import RegistryCore, make_agent_key, DISCOVERABLE_STATUS
+from agent_registry.status import is_discoverable_status
+from agent_registry.errors import (
+    AuthoritativeStoreUnavailable,
+    RegistryUnavailableError,
+    SemanticSearchUnavailable,
+)
+from agent_registry.identity import CallerIdentity, resolve_caller_identity
 from agent_registry.broadcast import get_broadcast_service, initialize_broadcast_service
-from agent_registry.broadcast.events import EventType, utc_now_iso
+from agent_registry.broadcast.events import EventType, utc_now_iso, public_event
+from agent_registry.broadcast.callback_policy import validate_callback_destination
 from agent_registry.broadcast.subscriptions import Subscription
 from agent_registry.health import get_health_service, initialize_health_service
 from agent_registry.health.state import HealthStatus
 from agent_registry.model.validated_agentcard import validate_agent_card
+from agent_registry.request_validation import card_batch, parse_card, semantic_query
 from agent_registry.registry_instance import get_registry, initialize_registry
 from agent_registry.middleware import ConnectionLimitMiddleware, TimeoutMiddleware
 from agent_registry.signature.agent_card_signature_validator import AgentCardSignatureValidator
@@ -73,7 +80,6 @@ from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
 from common.log.audit_logger import OperationResult, LogLevel, OperatorObject, OperationName
 from common.util.app_config import get_conf
-from common.cert.cert_cn_parser import validate_cn
 
 # Import knowledge graph router
 from agent_registry.knowledge_graph_api import knowledge_graph_router, close_neo4j_driver
@@ -214,6 +220,10 @@ async def semaphore_guard(sem: anyio.Semaphore):
         yield
     except HTTPException:
         raise
+    except RegistryUnavailableError as e:
+        # 503, not 500: the request is well formed and the server is healthy, the
+        # deployment simply has no record store (or model) to answer it from (R4/R12).
+        raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
     except Exception as e:
         logger.error(f"Unexpected error in endpoint: {e}")
         raise CustomHTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal server error") from e
@@ -304,6 +314,32 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content=content)
 
 
+@app.exception_handler(RegistryUnavailableError)
+async def registry_unavailable_handler(request: Request, exc: RegistryUnavailableError):
+    """503: the deployment cannot answer this request (no record store, no model).
+
+    `use_vectordb=true` leaves the registry without approval status, ownership,
+    tags or a trustworthy change feed, and a broken/missing model makes semantic
+    search impossible. Reporting that is the point: an empty result would look
+    like "no such agent" and a 500 would look like a server fault (R4/R12 in the
+    10-03 review). Registered on the base class so a new domain error cannot fall
+    through to the generic 500 handler.
+    """
+    logger.warning(f"Rejecting {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "errors": {
+                "error": [
+                    {
+                        "errorMessage": str(exc)
+                    }
+                ]
+            }
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     error_messages = "; ".join(
@@ -388,19 +424,23 @@ async def _audit_failure(op_name: OperationName, details: dict, client_ip: str,
     await _audit_result(op_name, False, details, client_ip, caller)
 
 
-def _verified_caller(owner: Optional[str]) -> str:
-    """Audit identity for main-port operations, gated on client-cert verification.
+def _caller_identity(request: Request) -> CallerIdentity:
+    """Resolve the caller identity from a verifiable credential.
 
-    The X-SSL-Client-DN header is client-forgeable when the listener runs
-    without mTLS; attributing audit records to it would poison the trail.
-    Only deployments with verify_client enabled (mTLS here or a trusted
-    proxy) contribute an identity; otherwise records stay unattributed.
+    Never reads a caller-supplied identity header outside
+    owner.identity.mode=trusted_proxy (see agent_registry/identity.py).
     """
-    if not owner:
-        return ''
-    if str(config.get('verify_client', 'true')).lower() == 'false':
-        return ''
-    return owner
+    if not OWNER_ISOLATION_ENABLED:
+        return CallerIdentity()
+    identity = resolve_caller_identity(request, config)
+    if not identity.verified and identity.detail:
+        logger.debug(f"Caller identity unverified: {identity.detail}")
+    return identity
+
+
+def _audit_caller(identity: CallerIdentity) -> str:
+    """Audit identity for main-port operations: verified identities only."""
+    return identity.audit_identity()
 
 
 async def _maybe_audit_read(op_name: OperationName, details: dict, client_ip: str,
@@ -416,38 +456,18 @@ async def _maybe_audit_read(op_name: OperationName, details: dict, client_ip: st
     await _audit_result(op_name, True, details, client_ip, caller)
 
 
-def _get_owner_from_request(request: Request) -> Optional[str]:
-    """
-    Extract owner (CN) from request header X-SSL-Client-DN.
-    Parses CN from the DN string format: CN=username,O=Org,C=US
-
-    Returns:
-        CN value (None if not present or if owner isolation is disabled)
-    """
-    if not OWNER_ISOLATION_ENABLED:
-        return None
-
-    dn = request.headers.get('X-SSL-Client-DN')
-    if dn:
-        # Parse CN from DN string (format: CN=username,O=Org,C=US)
-        dn = dn.strip()
-        cn_value = None
-        for part in dn.split(','):
-            part = part.strip()
-            if part.upper().startswith('CN='):
-                cn_value = part[3:].strip()
-                break
-
-        if cn_value:
-            if OWNER_VALIDATION_MODE == 'strict':
-                if not validate_cn(cn_value):
-                    logger.warning(f"Invalid CN format: {cn_value}")
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Invalid CN format: {cn_value}"
-                    )
-            return cn_value
-    return None
+def _require_verified_identity(identity: CallerIdentity, operation: str) -> str:
+    """Fail closed when a write needs an identity that cannot be verified."""
+    if not identity.verified:
+        logger.warning(
+            f"Rejecting {operation}: caller identity could not be verified "
+            f"({identity.detail or 'no credential'})")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=("Caller identity could not be verified. Present a valid client "
+                    "certificate or use a deployment with a configured trusted proxy."),
+        )
+    return identity.owner or ''
 
 
 async def _verify_owner_permission(
@@ -460,21 +480,22 @@ async def _verify_owner_permission(
     Verify owner permission for update/delete operations.
 
     Flow:
-    1. Extract CN from request as current_owner
+    1. Resolve the caller identity from a verifiable credential
     2. Query agent to get stored_owner
-    3. Check if stored_owner is None/empty (public agent) - allow any user
-    4. If stored_owner is set, verify current_owner matches
+    3. Require a verified identity; legacy ownerless cards require admin claim
+    4. Require the verified identity to match the stored owner
 
     Returns:
         current_owner (if verification succeeds)
 
     Raises:
-        HTTPException: If permission denied or agent not found
+        HTTPException: 404 if the agent is missing, 401 if the caller identity
+            cannot be verified, 403 if a verified caller is not the owner
     """
     if not OWNER_ISOLATION_ENABLED:
         return None
 
-    current_owner = _get_owner_from_request(request)
+    identity = _caller_identity(request)
 
     agent_record = registry.get_by_key_with_owner(name, organization)
     if not agent_record:
@@ -485,17 +506,21 @@ async def _verify_owner_permission(
 
     stored_owner = agent_record.owner
 
-    if stored_owner is None or stored_owner == '':
-        return current_owner
+    _require_verified_identity(identity, f"{request.method} {name}/{organization}")
 
-    if current_owner != stored_owner:
-        logger.warning(f"Permission denied: current_owner={current_owner}, stored_owner={stored_owner}")
+    if not stored_owner:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Legacy agent has no owner; an administrator must assign ownership")
+
+    if identity.owner != stored_owner:
+        logger.warning(
+            f"Permission denied: current_owner={identity.owner}, stored_owner={stored_owner}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Permission denied: agent belongs to {stored_owner}"
         )
 
-    return current_owner
+    return identity.owner
 
 
 async def _check_agent_limit(registry: RegistryCore, client_ip: str, details: dict,
@@ -530,22 +555,79 @@ def _is_hidden_unhealthy(name: str, organization: str) -> bool:
         return False
 
 
+def _is_public_agent(name: str, organization: str, registry: RegistryCore) -> bool:
+    """Approval visibility shared by discovery and health monitoring.
+
+    Monitoring must still show published suspect/offline agents; the optional
+    unhealthy filter only excludes them from task-discovery results.
+    """
+    return registry.get_status(name, organization) == DISCOVERABLE_STATUS
+
+
+def _is_discoverable(name: str, organization: str, registry: RegistryCore) -> bool:
+    """Visibility rule for task-discovery reads, not health monitoring.
+
+    A card is discoverable when it is published (approval granted) and heartbeat
+    detection is not hiding it. List, exact query and semantic query must all
+    apply this same predicate, otherwise a pending card leaks through whichever
+    path forgot it. `get_status()` returns None only for a *missing* record, so a
+    None status must hide the card rather than fall through to the legacy default.
+    """
+    if not _is_public_agent(name, organization, registry):
+        return False
+    return not _is_hidden_unhealthy(name, organization)
+
+
 def _validate_callback_url(url: str) -> None:
-    """Webhook SSRF guard: scheme restriction plus an optional hostname allowlist."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+    """Require an operator-authorized destination for a webhook callback."""
+    if not isinstance(url, str):
         raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "callback_url must be a valid http(s) URL")
-    allow_http = str(get_conf().get(BROADCAST_ALLOW_HTTP_CALLBACKS, "false")).lower() == "true"
-    if parsed.scheme == "http" and not allow_http:
+                                  "callbackUrl must be a URL string")
+    try:
+        validate_callback_destination(url)
+    except ValueError as e:
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e)) from e
+
+
+def _enqueue_drop_oldest(queue: 'asyncio.Queue', event: Any) -> None:
+    """Add an event to a bounded stream queue without ever raising.
+
+    Called through ``loop.call_soon_threadsafe`` from the broadcast thread: an
+    unhandled ``QueueFull`` there surfaces as a loop-callback error and would
+    silently stop the stream for a slow consumer. Instead the oldest queued event
+    is dropped so the consumer still receives the most recent state.
+    """
+    try:
+        queue.put_nowait(event)
+        return
+    except asyncio.QueueFull:
+        pass
+    try:
+        queue.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
+
+
+async def _parse_json_object(request: Request, context: str = 'request body') -> dict:
+    """Parse a JSON object body, mapping malformed input to a clear 422.
+
+    Callers must use this instead of ``await request.json()`` so that an empty,
+    non-JSON or non-object body is reported as client input rather than escaping
+    as an unhandled 500 (see the semantic-query contract).
+    """
+    try:
+        body = await request.json()
+    except ValueError as e:  # json.JSONDecodeError / UnicodeDecodeError
         raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "HTTP callbacks are disabled; use an HTTPS callback_url")
-    allowlist = str(get_conf().get(BROADCAST_CALLBACK_ALLOWLIST, "")).strip()
-    if allowlist:
-        allowed_hosts = [h.strip() for h in allowlist.split(",") if h.strip()]
-        if parsed.hostname not in allowed_hosts:
-            raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                      f"callback host '{parsed.hostname}' is not in the allowlist")
+                                  f"The {context} must be a JSON object") from e
+    if not isinstance(body, dict):
+        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                  f"The {context} must be a JSON object")
+    return body
 
 
 async def _perform_registration(
@@ -566,6 +648,10 @@ async def _perform_registration(
         await _audit_failure(OperationName.REGISTER_AGENT, details, client_ip, caller)
         logger.error(f"Register agent failed: name={agent.name}, org={agent.provider.organization}, reason={e}")
         raise CustomHTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except RegistryUnavailableError:
+        # Never a 500: this is the deployment's missing store/model, and the
+        # documented answer is 503 (the wrapper must not swallow it).
+        raise
     except Exception as e:
         details["message"] = "Internal server error"
         await _audit_failure(OperationName.REGISTER_AGENT, details, client_ip, caller)
@@ -594,6 +680,10 @@ async def _perform_update(
         await _audit_failure(OperationName.UPDATE_AGENT, details, client_ip, caller)
         logger.error(f"Update agent failed: name={name}, org={organization}, reason={e}")
         raise CustomHTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except RegistryUnavailableError:
+        # registry.update() raises the missing-store error here; wrapping it as a
+        # 500 made PUT the one surface that contradicted the 503 contract.
+        raise
     except Exception as e:
         details["message"] = "Internal server error"
         await _audit_failure(OperationName.UPDATE_AGENT, details, client_ip, caller)
@@ -622,21 +712,24 @@ async def register_agent(
     On failure the error response additionally carries "registeredAgents" with the
     cards already registered by this request (partial success visibility).
     """
-    body = await request.json()
-    agent_cards = body.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "agentCards must be a non-empty list")
+    body = await _parse_json_object(request)
+    agent_cards = card_batch(body)
     client_ip = request.client.host
     total_cards = len(agent_cards)
 
-    owner = _get_owner_from_request(request) if OWNER_ISOLATION_ENABLED else None
+    caller_identity = _caller_identity(request)
+    owner = caller_identity.owner
+    if OWNER_ISOLATION_ENABLED and OWNER_VALIDATION_MODE == 'strict':
+        # Strict mode requires an identified owner (Security Guide: a registration
+        # without a CN is rejected). Relaxed mode keeps owner-less cards possible.
+        _require_verified_identity(caller_identity, 'register agent')
 
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)
 
     return await _process_register_cards(
         agent_cards, client_ip, owner, registry, signature_validator, registry_signer,
-        caller=_verified_caller(owner))
+        caller=_audit_caller(caller_identity))
 
 
 async def _process_register_cards(
@@ -648,7 +741,11 @@ async def _process_register_cards(
     registered_results = []
     async with semaphore_guard(register_semaphore):
         for index, agent_card in enumerate(agent_cards, start=1):
-            agent = Parse(json.dumps(agent_card), AgentCard())
+            try:
+                agent = parse_card(agent_card)
+            except HTTPException as exc:
+                raise CustomHTTPException(exc.status_code, f'Card {index}/{total_cards}: {exc.detail}',
+                                          extra={'registeredAgents': registered_results}) from exc
             card_started = time.perf_counter()
             logger.info(
                 f"Register agent request: card={index}/{total_cards}, name={agent.name}, org={agent.provider.organization}, client={client_ip}, owner={owner}")
@@ -668,7 +765,7 @@ async def _process_register_cards(
                     raise CustomHTTPException(
                         e.status_code, f"Card {index}/{total_cards} ({agent.name}): {e.detail}") from e
 
-                signature_result = signature_validator.validate_agent_card(agent)
+                signature_result = await signature_validator.validate_agent_card_async(agent)
                 if not signature_result.is_valid:
                     details["message"] = signature_result.error_message
                     await _audit_failure(OperationName.REGISTER_AGENT, details, client_ip, caller)
@@ -736,7 +833,7 @@ async def list_agents_exact(
     await authenticate_handle.handle(client_ip, request)
     await _maybe_audit_read(OperationName.QUERY_AGENT,
                             {"name": name or '', "organization": organization or ''},
-                            client_ip, caller=_verified_caller(_get_owner_from_request(request)))
+                            client_ip, caller=_audit_caller(_caller_identity(request)))
 
     async with semaphore_guard(query_semaphore):
         query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
@@ -744,10 +841,7 @@ async def list_agents_exact(
 
         published_agents = []
         for agent in agents:
-            agent_status = registry.get_status(agent.name, agent.provider.organization)
-            if agent_status != 'published':
-                continue
-            if _is_hidden_unhealthy(agent.name, agent.provider.organization):
+            if not _is_discoverable(agent.name, agent.provider.organization, registry):
                 continue
             agent_dict = MessageToDict(agent)
             published_agents.append(agent_dict)
@@ -770,10 +864,8 @@ async def update_agent(
     On success returns 200 with {"results": [{"name", "organization", "registrySigned"}]}.
     Returns 404 if the agent does not exist.
     """
-    body_json = await request.json()
-    agent_cards = body_json.get("agentCards", [])
-    if not agent_cards:
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "agentCards must be a non-empty list")
+    body_json = await _parse_json_object(request)
+    agent_cards = card_batch(body_json)
     client_ip = request.client.host
     total_cards = len(agent_cards)
 
@@ -784,7 +876,7 @@ async def update_agent(
 
     return await _process_update_cards(
         agent_cards, client_ip, name, organization, owner, signature_validator, registry_signer,
-        caller=_verified_caller(owner))
+        caller=_audit_caller(_caller_identity(request)))
 
 
 async def _process_update_cards(
@@ -796,7 +888,11 @@ async def _process_update_cards(
     updated_results = []
     async with semaphore_guard(update_semaphore):
         for index, agent_card in enumerate(agent_cards, start=1):
-            agent_data = Parse(json.dumps(agent_card), AgentCard())
+            try:
+                agent_data = parse_card(agent_card, name=name, organization=organization)
+            except HTTPException as exc:
+                raise CustomHTTPException(exc.status_code, f'Card {index}/{total_cards}: {exc.detail}',
+                                          extra={'updatedAgents': updated_results}) from exc
             card_started = time.perf_counter()
             logger.info(f"Update agent request: card={index}/{total_cards}, name={name}, org={organization}, client={client_ip}, owner={owner}")
             details = {
@@ -813,7 +909,7 @@ async def _process_update_cards(
                     raise CustomHTTPException(
                         e.status_code, f"Card {index}/{total_cards} ({agent_data.name}): {e.detail}") from e
 
-                signature_result = signature_validator.validate_agent_card(agent_data)
+                signature_result = await signature_validator.validate_agent_card_async(agent_data)
                 if not signature_result.is_valid:
                     details["message"] = signature_result.error_message
                     await _audit_failure(OperationName.UPDATE_AGENT, details, client_ip, caller)
@@ -876,7 +972,8 @@ async def deregister_agent(
     async with semaphore_guard(deregister_semaphore):
         deregister_handle = HandlerRegistry.get_handler(InterfaceType.DEREGISTER)
         success = await deregister_handle.handle(name, organization, owner=owner)
-        await _audit_result(OperationName.DEREGISTER_AGENT, success, details, client_ip, caller=_verified_caller(owner))
+        await _audit_result(OperationName.DEREGISTER_AGENT, success, details, client_ip,
+                            caller=_audit_caller(_caller_identity(request)))
         if not success:
             raise CustomHTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
         logger.info(f"Deregister agent success: name={name}, org={organization}")
@@ -889,29 +986,32 @@ async def deregister_agent(
 @app.post("/rest/v1/registry-center/agent-cards/semantic-query", response_model=None, summary="Fuzzy retrieve by task")
 async def retrieve_agents_by_task(
         request: Request,
-        top_n: int = 10,
+        top_n: int = Query(10, ge=1, le=50),
+        registry: RegistryCore = Depends(get_registry),
         _: Any = Depends(RateLimiter('retrieve'))
 ):
     """
     Find agents that are semantically relevant to the given task using LLM.
     """
-    body_json = await request.json()
-    task = body_json.get("task")
+    body_json = await _parse_json_object(request)
+    task, top_n = semantic_query(body_json, top_n)
     client_ip = request.client.host
-    logger.info(f"Retrieve agents request: task='{task}', top_n={top_n}, client={client_ip}")
+    logger.info("Retrieve agents request: top_n={}, client={}", top_n, client_ip)
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)
     await _maybe_audit_read(OperationName.RETRIEVE_AGENT,
-                            {"task": str(task)[:200]},
-                            client_ip, caller=_verified_caller(_get_owner_from_request(request)))
+                            {"top_n": top_n},
+                            client_ip, caller=_audit_caller(_caller_identity(request)))
 
     async with semaphore_guard(retrieve_semaphore):
         retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
         agents = await retrieve_handle.handle(task, top_n)
+        # Defence in depth: a handler (or a vector projection lagging behind an
+        # approval decision) must not be able to surface a non-discoverable card.
         agents = [agent for agent in agents
-                  if not _is_hidden_unhealthy(agent.name, agent.provider.organization)]
+                  if _is_discoverable(agent.name, agent.provider.organization, registry)]
         result = [MessageToDict(agent) for agent in agents]
-        logger.info(f"Retrieve agents result: {len(result)} agents found for task='{task}'")
+        logger.info("Retrieve agents result: {} agents", len(result))
         return {"agentCards": result}
 
 
@@ -933,7 +1033,7 @@ async def get_agent(
     await authenticate_handle.handle(client_ip, request)
     await _maybe_audit_read(OperationName.GET_AGENT,
                             {"name": name, "organization": organization},
-                            client_ip, caller=_verified_caller(_get_owner_from_request(request)))
+                            client_ip, caller=_audit_caller(_caller_identity(request)))
 
     async with semaphore_guard(get_semaphore):
         get_handle = HandlerRegistry.get_handler(InterfaceType.GET)
@@ -942,11 +1042,7 @@ async def get_agent(
         if record is None:
             return {"agentCards": []}
 
-        agent_status = registry.get_status(name, organization)
-        if agent_status != 'published':
-            return {"agentCards": []}
-
-        if _is_hidden_unhealthy(name, organization):
+        if not _is_discoverable(name, organization, registry):
             return {"agentCards": []}
 
         agent_dict = MessageToDict(record.agent_card)
@@ -986,18 +1082,25 @@ async def report_heartbeat(
                 "heartbeat_enabled": False,
                 "server_time": utc_now_iso(),
             })
+        # A heartbeat is a liveness claim about a specific card: it decides whether
+        # a dead card is hidden and whether the offline TTL deregisters it, and it
+        # can publish a public health event. With owner isolation enabled only the
+        # card's owner may make that claim (same policy as update/delete).
+        if OWNER_ISOLATION_ENABLED:
+            await _verify_owner_permission(request, name, organization, registry)
         record = registry.get_by_key_with_owner(name, organization)
         if record is None:
             raise CustomHTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
 
         previous, state = health_service.record_heartbeat(name, organization)
-        if previous is not None and previous != state.status:
+        if previous is not None and previous != state.status and is_discoverable_status(record.status):
             get_broadcast_service().event_bus.publish(EventType.AGENT_HEALTH_CHANGED, {
                 "name": name,
                 "organization": organization,
                 "health_status": state.status.value,
                 "previous_health_status": previous.value,
                 "tags": registry.get_agent_tags(name, organization) or [],
+                "discovery_public": True,
             })
             logger.info(f"Agent recovered via heartbeat: {name}({organization}) "
                         f"{previous.value} -> {state.status.value}")
@@ -1015,6 +1118,7 @@ async def report_heartbeat(
 @app.get("/rest/v1/registry-center/agents/health", summary="List agent health states")
 async def list_agents_health(
         request: Request,
+        registry: RegistryCore = Depends(get_registry),
         health_status: Optional[str] = Query(None, alias="status",
                                              description="Filter: healthy/suspect/offline"),
         _: Any = Depends(RateLimiter('query')),
@@ -1032,6 +1136,8 @@ async def list_agents_health(
         health_service = get_health_service()
         agents = []
         for state in health_service.list_monitored():
+            if not _is_public_agent(state.name, state.organization, registry):
+                continue
             if health_status is not None and state.status.value != health_status:
                 continue
             agents.append({
@@ -1050,6 +1156,7 @@ async def list_agents_health(
          summary="Query agent health transition history")
 async def list_agents_health_history(
         request: Request,
+        registry: RegistryCore = Depends(get_registry),
         name: Optional[str] = Query(None, description="Filter by agent name"),
         organization: Optional[str] = Query(None, description="Filter by organization"),
         limit: int = Query(50, ge=1, le=500, description="Max entries"),
@@ -1065,13 +1172,16 @@ async def list_agents_health_history(
         if not health_service.enabled:
             raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                                       "Heartbeat detection is disabled")
-        return {"history": health_service.history(name, organization, limit)}
+        history = [item for item in health_service.history(name, organization, limit)
+                   if _is_public_agent(item['name'], item['organization'], registry)]
+        return {"history": history}
 
 
 @app.get("/rest/v1/registry-center/agents/health/stream",
          summary="Stream agent health changes (Server-Sent Events)")
 async def stream_agent_health(
         request: Request,
+        registry: RegistryCore = Depends(get_registry),
         _: Any = Depends(RateLimiter('query')),
 ):
     """
@@ -1088,6 +1198,11 @@ async def stream_agent_health(
         raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                                   "Heartbeat detection is disabled")
 
+    # Fail before the stream starts: this generator filters events through the
+    # visibility rule, so without a record store the 503 could no longer be sent
+    # once the 200 response has begun.
+    registry.require_authoritative_store("streaming health changes")
+
     broadcast_service = get_broadcast_service()
     loop = asyncio.get_running_loop()
     event_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -1096,7 +1211,7 @@ async def stream_agent_health(
         if event.event_type != EventType.AGENT_HEALTH_CHANGED:
             return
         try:
-            loop.call_soon_threadsafe(event_queue.put_nowait, event)
+            loop.call_soon_threadsafe(_enqueue_drop_oldest, event_queue, event)
         except RuntimeError:
             pass  # event loop already closed
 
@@ -1109,6 +1224,9 @@ async def stream_agent_health(
                     break
                 try:
                     event = await asyncio.wait_for(event_queue.get(), timeout=15.0)
+                    if not _is_public_agent(event.data.get('name'),
+                                            event.data.get('organization'), registry):
+                        continue
                     payload = json.dumps(event.to_dict(), ensure_ascii=False)
                     yield f"event: health_changed\ndata: {payload}\n\n"
                 except asyncio.TimeoutError:
@@ -1130,7 +1248,7 @@ async def create_subscription(
         request: Request,
         _: Any = Depends(RateLimiter('subscription')),
 ):
-    body = await request.json()
+    body = await _parse_json_object(request)
     client_ip = request.client.host
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)
@@ -1169,7 +1287,7 @@ async def create_subscription(
         created = broadcast_service.subscription_store.create(subscription)
         if broadcast_service.dispatcher is not None:
             broadcast_service.dispatcher.add_subscription(created)
-        logger.info(f"Subscription created: {created.subscription_id} -> {created.callback_url}")
+        logger.info("Subscription created: {}", created.subscription_id)
         return JSONResponse(status_code=status.HTTP_201_CREATED, content=created.to_dict())
 
 
@@ -1233,7 +1351,7 @@ async def list_changes(
         events = events[:limit]
         next_since = events[-1].registry_version if events else since
         return {
-            "changes": [e.to_dict() for e in events],
+            "changes": [public_event(e).to_dict() for e in events],
             "has_more": has_more,
             "next_since": next_since,
         }
@@ -1272,11 +1390,14 @@ async def startup_services():
 
 
 async def shutdown_services():
-    global _health_sweeper
+    global _health_sweeper, _signature_validator
     if _health_sweeper is not None:
         await _health_sweeper.stop()
         _health_sweeper = None
     await get_broadcast_service().stop()
+    if _signature_validator is not None:
+        await _signature_validator.jwk_fetcher.aclose()
+        _signature_validator = None
 
 
 def _initialize_registry_guarded():

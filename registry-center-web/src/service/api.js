@@ -22,11 +22,11 @@
 // Auth is mTLS (client certificate) handled by the browser; no bearer token.
 
 import axios from 'axios'
+import { resolveBaseUrl } from './base_url.js'
 
 const STORAGE_KEY = 'server_config'
 export const defaultIp = '127.0.0.1'
 export const defaultPort = '5000'
-export const defaultProtocol = 'http://'
 const API_PREFIX = '/rest/v1/registry-center'
 
 export const getServerConfig = () => {
@@ -48,23 +48,10 @@ export const getBaseUrl = () => {
     // proxy (see vite.config.js). This avoids cross-origin (CORS) regardless of
     // any Direct IP config saved via Settings. To point dev at a different
     // backend, set VITE_BACKEND_TARGET and restart `npm run dev`.
-    if (import.meta.env.DEV) {
-        return ''
-    }
-    const cfg = getServerConfig()
-    if (!cfg) {
-        // Relative: same-origin in prod (serve the built app from the backend/nginx).
-        return ''
-    }
-    if (cfg.mode === 'nginx') {
-        const url = (cfg.nginxUrl || '').trim()
-        return url || ''
-    }
-    // mode === 'ip' (default) — only meaningful for the production build.
-    const protocol = 'http://'
-    const ip = cfg.ip || defaultIp
-    const port = cfg.port || defaultPort
-    return `${protocol}${ip}:${port}`
+    return resolveBaseUrl(getServerConfig(), {
+        development: import.meta.env.DEV,
+        pageProtocol: window.location.protocol,
+    })
 }
 
 const REGISTRY_BASE = () => `${getBaseUrl()}${API_PREFIX}`

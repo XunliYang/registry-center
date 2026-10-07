@@ -251,7 +251,8 @@ agent-registry>
 | ssl_keyfile | Service private key path | etc/ssl/server_key.pem |
 | signature_validation_enabled | Signature verification switch | true |
 | agent_approval_enabled | Approval switch | false |
-| use_vectordb | Enable vector database (replaces the authoritative store; approval/tags may stop working) | false |
+| use_vectordb | Enable vector database (replaces the authoritative store; approval/ownership/tag endpoints and status-announcing mutations then return 503 instead of empty results) | false |
+| startup.strict.storage | Refuse to start when use_vectordb=true leaves the registry without an authoritative record store | false |
 
 ### Persistence Configuration (etc/conf/persistence.conf)
 
@@ -268,7 +269,7 @@ agent-registry>
 | Configuration Item | Description | Default |
 |--------------------|-------------|---------|
 | agent.num.max | Maximum number of Agents | 100 |
-| connection.max | Maximum connections | 500 |
+| connection.max | Maximum active HTTP responses, including the complete SSE lifetime; not an OS TCP socket count | 500 |
 | connection.timeout | Timeout (seconds) | 300 |
 
 ### Heartbeat Detection Configuration (etc/conf/server.conf)
@@ -283,7 +284,7 @@ Agents periodically report liveness, and the Registry Center determines health s
 | heartbeat.grace.period | Suspect-state buffer duration (seconds) | 10 |
 | heartbeat.sweep.interval | Background sweep period (seconds) | 10 |
 | heartbeat.offline.ttl | Auto-deregister Agents offline longer than this (0 = disabled) | 0 |
-| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from query results | false |
+| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from **task-discovery** query results (the health list/history/SSE always show them, so offline alerts stay visible) | false |
 | flowcontrol.ratelimit.heartbeat | Heartbeat API rate limit (requests/second/IP) | 100 |
 
 ### Change Broadcast Configuration (etc/conf/server.conf)
@@ -293,15 +294,31 @@ Registry changes (registration/update/deregistration/health changes) are pushed 
 | Configuration Item | Description | Default |
 |--------|------|--------|
 | broadcast.enabled | Broadcast master switch | false |
-| broadcast.debounce.window | Debounce window (seconds); repeated changes of one Agent are coalesced | 2 |
+| broadcast.debounce.window | Batch window (seconds); retains each durable event ID in version order | 2 |
 | broadcast.max.events.per.second | Per-subscription delivery rate limit (overflow degrades to a summary event) | 50 |
 | broadcast.webhook.timeout | Delivery timeout (seconds) | 10 |
 | broadcast.webhook.max.retries | Maximum retries (exponential backoff) | 5 |
 | broadcast.webhook.backoff.base | Backoff base (seconds) | 2 |
 | broadcast.webhook.backoff.max | Backoff cap (seconds) | 300 |
+| broadcast.delivery.max.attempts | Attempt budget for durable retry of failed deliveries; once spent, the delivery stays failed in the internal ledger (`/changes` returns event content for reconciliation, not delivery status) | 5 |
+| broadcast.delivery.retry.interval | Seconds between durable retry sweeps (also swept once at startup) | 60 |
 | broadcast.outbox.retention.days | Event retention days | 7 |
 | broadcast.allow.http.callbacks | Whether HTTP callbacks are allowed (development only) | false |
-| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names) | empty |
+| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names); mandatory before subscriptions can be created | empty (fails closed) |
+
+The in-process wake-up queue holds at most 1,024 hints; the dispatcher caches
+at most 1,024 subscriber/event pairs. Each subscriber has one queued batch and
+one active batch (at most 256 events per batch). Overflow remains in the outbox
+and is recovered in pages; these are implementation bounds, not new
+configuration keys. They do not bound the durable backlog or the total memory
+of file/memory stores, which keep retained events resident. Monitor backlog
+and disk capacity; a slow destination is not made fast by bounded queues.
+
+The default semantic-query handler offloads synchronous model/vector I/O with
+at most eight active queries per listener event loop. Cancelling the HTTP
+await does not cancel a running synchronous request: it retains its slot until
+completion or the model adapter's HTTP timeout. Configure that timeout
+appropriately; a request timeout does not mean the remote model stopped work.
 
 ## Error Code Quick Reference
 
@@ -362,9 +379,9 @@ Yes. The Registry Center supports Windows environments for development and debug
 
 ### Q6: Semantic matching / intelligent filtering always returns an empty list — how do I debug it?
 
-**Symptom**: A semantic search call always returns an empty `agentCards` list, indistinguishable from "no matching Agent".
+**Symptom**: Semantic search returns no candidates, or reports 503 when the model is unavailable.
 
-**Cause**: The feature depends on the `chat` capability in `etc/config/models.yaml` (plus `rerank` when reranking is enabled). That file is local configuration and is not shipped in the package or image, so without it the API still returns 200 — with an empty result.
+**Cause**: The feature depends on the `chat` capability in `etc/config/models.yaml`. Missing configuration, model failure, or invalid output now returns 503. A 200 empty result means no published candidate matched (or no published candidates were available), rather than a hidden model error. Pending Agents are not sent to the selection model.
 
 **Steps**:
 

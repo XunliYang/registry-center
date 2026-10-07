@@ -31,7 +31,7 @@ class TestConnectionLimitMiddleware:
     @pytest.fixture
     def middleware(self):
         from agent_registry.middleware import ConnectionLimitMiddleware
-        app = MagicMock()
+        app = AsyncMock()
         return ConnectionLimitMiddleware(app, max_connections=2)
 
     def create_mock_request(self):
@@ -40,29 +40,24 @@ class TestConnectionLimitMiddleware:
 
     @pytest.mark.asyncio
     async def test_within_limit(self, middleware):
-        request = self.create_mock_request()
-        async def call_next(r):
-            return JSONResponse({"ok": True})
-        response = await middleware.dispatch(request, call_next)
-        assert response.status_code == 200
+        await middleware({'type': 'http'}, AsyncMock(), AsyncMock())
+        middleware.app.assert_awaited_once()
+        assert middleware.active_connections == 0
 
     @pytest.mark.asyncio
     async def test_at_limit_returns_503(self, middleware):
-        request = self.create_mock_request()
-        # Exhaust the semaphore
+        # Exhaust the response quota.
         middleware.active_connections = 2
-        async def call_next(r):
-            return JSONResponse({"ok": True})
-        response = await middleware.dispatch(request, call_next)
-        assert response.status_code == 503
+        send = AsyncMock()
+        await middleware({'type': 'http'}, AsyncMock(), send)
+        assert send.call_args_list[0].args[0]['status'] == 503
+        middleware.app.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_exception_propagates_not_swallowed(self, middleware):
-        request = self.create_mock_request()
-        async def call_next(r):
-            raise ValueError("Boom")
+        middleware.app.side_effect = ValueError('Boom')
         with pytest.raises(ValueError, match="Boom"):
-            await middleware.dispatch(request, call_next)
+            await middleware({'type': 'http'}, AsyncMock(), AsyncMock())
         # Connection count should still be decremented
         assert middleware.active_connections == 0
 
