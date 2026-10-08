@@ -75,7 +75,25 @@ def _make_cert(cn, key, issuer_cert, issuer_key, not_after, is_ca=False,
                .not_valid_before(not_before or (datetime.datetime.now(datetime.timezone.utc)
                                                 - datetime.timedelta(days=1)))
                .not_valid_after(not_after)
-               .add_extension(x509.BasicConstraints(ca=is_ca, path_length=None), critical=True))
+               .add_extension(x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
+               .add_extension(x509.KeyUsage(
+                   digital_signature=not is_ca,
+                   content_commitment=False,
+                   key_encipherment=not is_ca,
+                   data_encipherment=False,
+                   key_agreement=False,
+                   key_cert_sign=is_ca,
+                   crl_sign=is_ca,
+                   encipher_only=False,
+                   decipher_only=False,
+               ), critical=True)
+               .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+                              critical=False))
+    if issuer_cert is not None and issuer_key is not None:
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
     return builder.sign(issuer_key or key, hashes.SHA256())
 
 
@@ -121,6 +139,21 @@ def pki(tmp_path_factory):
                    .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
                    .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30))
                    .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                   .add_extension(x509.KeyUsage(
+                       digital_signature=True,
+                       content_commitment=False,
+                       key_encipherment=True,
+                       data_encipherment=False,
+                       key_agreement=False,
+                       key_cert_sign=False,
+                       crl_sign=False,
+                       encipher_only=False,
+                       decipher_only=False,
+                   ), critical=True)
+                   .add_extension(x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()),
+                                  critical=False)
+                   .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                                  critical=False)
                    .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ip("127.0.0.1"))]),
                                   critical=False)
                    .sign(ca_key, hashes.SHA256()))
