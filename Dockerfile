@@ -19,13 +19,9 @@
 # Build:
 #   podman build -t registry-center:latest .
 #
-# Run (local):
-#   podman run -e DB_HOST=host -e DB_USERNAME=user -e DB_PASSWORD=pass \
-#     -p 8080:8080 registry-center:latest
-#
-# Init (container-native, non-interactive):
-#   podman run --rm -e DB_HOST=host -e DB_USERNAME=user -e DB_PASSWORD=pass \
-#     registry-center:latest init
+# Mount deployment certificates/configuration at runtime, never at build time.
+# See docs/container-deployment.md for secure and local-development examples.
+# `init` validates preconfigured settings without stdin; it does not issue certs.
 
 FROM python:3.12-slim AS builder
 
@@ -61,15 +57,24 @@ ENV PATH="/opt/venv/bin:$PATH" \
     REGISTRY_VERIFY_CLIENT=true \
     REGISTRY_OWNER_ISOLATION_ENABLED=true \
     REGISTRY_FORWARDED_ALLOW_IPS="127.0.0.1" \
-    REGISTRY_OWNER_VALIDATION_MODE=relaxed
+    REGISTRY_STARTUP_STRICT_IDENTITY=true
 
-COPY . /opt/registry-center/
+# An allowlist is a second boundary in addition to .dockerignore. Public
+# templates, not the developer's mutable deployment files, seed the image.
+COPY agent_registry/ /opt/registry-center/agent_registry/
+COPY common/ /opt/registry-center/common/
+COPY bin/entrypoint.sh /opt/registry-center/bin/entrypoint.sh
+COPY etc/conf/server.conf.example /opt/registry-center/etc/conf/server.conf
+COPY etc/conf/persistence.conf.example /opt/registry-center/etc/conf/persistence.conf
+COPY etc/conf/server.properties etc/conf/log_config.conf /opt/registry-center/etc/conf/
 
-RUN useradd -m appuser \
+RUN useradd --uid 10001 -m appuser \
     && ln -sf /opt/registry-center /opt/app \
     && mkdir -p /opt/registry-center/log /opt/registry-center/run /opt/registry-center/data \
     && mkdir -p /opt/registry-center/etc/ssl /opt/registry-center/etc/sign_cert \
-    && chmod +x /opt/registry-center/bin/*.sh \
+    && sed -i 's/\r$//' /opt/registry-center/bin/entrypoint.sh \
+    && chmod 0755 /opt/registry-center/bin/entrypoint.sh \
+    && chmod 0600 /opt/registry-center/etc/conf/*.conf \
     && chown -R appuser:appuser /opt/registry-center /opt/venv
 
 WORKDIR /opt/registry-center

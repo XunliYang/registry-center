@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import getpass
@@ -16,6 +17,8 @@ from common.util.password_util import input_password_with_validation
 class InitCommand:
     def __init__(self):
         self.root_path = get_root_path()
+        # Wizard-owned deployment settings and feature switches only.
+        # Operating/business policies remain in server.properties, untouched.
         self.config_file = os.path.join(self.root_path, "etc", "conf", "server.conf")
         self.persistence_config_file = os.path.join(self.root_path, "etc", "conf", "persistence.conf")
         self.existing_config = self._parse_config_file(self.config_file)
@@ -550,9 +553,56 @@ class InitCommand:
         os.chmod(self.persistence_config_file, 0o600)
 
 
-def main():
-    init_cmd = InitCommand()
-    init_cmd.init_command()
+def validate_non_interactive_config():
+    """Validate preconfigured deployment settings without prompts or writes.
+
+    Container templates and environment variables provide the configuration.
+    This command does not issue certificates, migrate databases or test network
+    connectivity; the service performs its storage readiness check at startup.
+    """
+    from common.util.app_config import get_conf, get_persistence_conf
+    from agent_registry.identity import strict_startup_failures
+
+    root = Path(get_root_path())
+    for name in ('server.conf', 'server.properties', 'persistence.conf'):
+        if not (root / 'etc' / 'conf' / name).is_file():
+            raise ValueError(f'Missing etc/conf/{name}; provide deployment configuration first')
+    conf = get_conf()
+    port = str(conf.get('port', '5000'))
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError('Server port must be an integer between 1 and 65535')
+    for key in ('enable_https', 'verify_client', 'owner.isolation.enabled',
+                'registry.sign.enabled', 'signature_validation_enabled',
+                'startup.strict.identity'):
+        if key in conf and str(conf[key]).lower() not in ('true', 'false'):
+            raise ValueError(f'{key} must be true or false')
+    failures = strict_startup_failures(conf)
+    if failures:
+        raise ValueError('; '.join(failures))
+    persistence = get_persistence_conf()
+    if persistence.get('persistence.mode') not in ('file', 'sqlite', 'postgresql', 'gauss', 'mysql'):
+        raise ValueError('persistence.mode must be file, sqlite, postgresql, gauss or mysql')
+    if str(conf.get('enable_https', 'true')).lower() == 'true':
+        from common.cert.cert_validater import CertValidator
+        from common.util.conf_obj import ConfObj
+        result = CertValidator(ConfObj.as_object(conf)).validate()
+        if not result.is_valid:
+            raise ValueError(result.message)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Configure or validate Registry Center')
+    parser.add_argument('--non-interactive', action='store_true',
+                        help='validate existing config/env without prompting or modifying files')
+    args = parser.parse_args(argv)
+    if args.non_interactive:
+        try:
+            validate_non_interactive_config()
+        except ValueError as exc:
+            parser.exit(1, f'Configuration validation failed: {exc}\n')
+        print('Configuration validation passed (storage connectivity is checked by serve).')
+    else:
+        InitCommand().init_command()
 
 
 if __name__ == "__main__":
