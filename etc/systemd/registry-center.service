@@ -5,14 +5,38 @@ After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
+# This file is a template: bin/install_service.sh rewrites User, Group,
+# WorkingDirectory, APP_USER/APP_UID/APP_GID, OPENSSL_CONF and ExecStart and
+# installs the result as /etc/systemd/system/<SERVICE_NAME>.service (default
+# registry-center). Edit values here, not in the installed copy.
 Type=simple
+# Account that runs the service. install_service.sh sets the invoking user
+# (or SUDO_USER). It must own/read the installation directory, etc/ssl and
+# etc/conf; etc/conf must remain writable only if you use the container-style
+# entrypoint (this unit starts Python directly and never rewrites it).
 User=root
 Group=root
+# Must be the installation root: etc/conf/server.conf, etc/conf/persistence.conf
+# and the relative certificate paths in server.conf (etc/ssl/...) are resolved
+# against it. install_service.sh rewrites this to deploy.conf INSTALL_DIR.
 WorkingDirectory=/OpenA2A-T/registry-center
+# Audit attributes only: agent_registry/start.py records APP_USER/APP_UID/APP_GID
+# on the START_SERVICE audit event, defaulting to "unknown" when unset. They do
+# not change the process credentials - User/Group above do that.
 Environment="APP_USER=root"
 Environment="APP_UID=0"
 Environment="APP_GID=0"
+# OpenSSL group policy (TLS 1.3 named groups; see etc/conf/custom_openssl.cnf).
+# OpenSSL reads this file itself, and only OpenSSL 3.0+ honours the Groups
+# directive. install_service.sh rewrites the path to INSTALL_DIR.
+# Note: the container image does not set OPENSSL_CONF and does not ship this
+# file, so group restrictions apply to systemd deployments only.
 Environment="OPENSSL_CONF=/OpenA2A-T/registry-center/etc/conf/custom_openssl.cnf"
+# Started directly, without the container entrypoint: the listening address,
+# TLS material, storage backend and every feature switch come from
+# etc/conf/server.conf and etc/conf/server.properties, with REGISTRY_* variables
+# from the systemd environment applied last. Rewritten to
+# <PYTHON_PATH> -m agent_registry.start by install_service.sh.
 ExecStart=/usr/bin/python -m agent_registry.start
 ExecStop=/bin/kill -15 $MAINPID
 Restart=on-failure

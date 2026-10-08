@@ -11,6 +11,36 @@
 #
 # You will be prompted for your GCP Project ID and a database password.
 # =============================================================================
+#
+# Configuration surface (all optional; the environment variable of the same
+# name is used when set, otherwise the value is prompted for or defaulted):
+#   -ServiceName <name>      Cloud Run service and Cloud SQL instance prefix.
+#                            Default registry-center; must match
+#                            ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$.
+#   -GCPProjectID <id>       GCP project; falls back to GCP_PROJECT_ID, then a
+#                            prompt. Required - the script exits 1 without it.
+#   -DevelopmentOnly         Mandatory: without it the script refuses to run at
+#                            all, because Cloud Run provides no verified owner
+#                            identity.
+#   GCP_REGION               Default asia-east1.
+#   DB_PASSWORD              PostgreSQL password for the generated user. Read
+#                            from Secret Manager <service>-db-password-<project>
+#                            when available, otherwise prompted for and
+#                            auto-generated (16 chars) when left empty. It is
+#                            never passed as a literal --set-env-vars value: it
+#                            is stored in Secret Manager and injected with
+#                            --set-secrets.
+#
+# Derived values (not operator-settable): Artifact Registry repository
+# "openan-repo", Cloud SQL instance <service>-db (POSTGRES_15, db-f1-micro,
+# 10 GB SSD), database <service with '-' replaced by '_'>, user = the first
+# '-'-separated segment of the service name, service account <service>-sa with
+# roles/cloudsql.client and secretmanager.secretAccessor.
+#
+# Environment variables that must NOT be exported by the caller: the script
+# deletes the residual ones below on every run so a previous deployment in the
+# same PowerShell session cannot leak into this one.
+# =============================================================================
 
 param(
     [string]$ServiceName = "",
@@ -33,6 +63,8 @@ $PSNativeCommandUseErrorActionPreference = $false
 # ── Clear residual env vars from previous runs ──────────────────────────────
 # Prevents cross-contamination when deploying multiple services in the same
 # PowerShell session.
+# REGISTRY_FORWARDED_ALLOW_IPS is cleared even though it is also an image
+# default: this script sets it to "*" (see the Cloud Run env block below).
 $cleanupVars = @('GCP_PROJECT_ID', 'GCP_REGION', 'DB_PASSWORD', 'PERSISTENCE_MODE', 'DB_HOST', 'DB_PORT',
                  'DB_NAME', 'DB_USERNAME', 'DB_POOL_MIN', 'DB_POOL_MAX',
                  'REGISTRY_ENABLE_HTTPS', 'REGISTRY_FORWARDED_ALLOW_IPS',
@@ -233,6 +265,24 @@ Write-Host "[5/5] Deploying to Cloud Run (building & deploying, ~5 minutes)..."
 Write-Host ""
 
 # Build the env vars string separately to ensure correct expansion
+# Runtime configuration of the deployed revision. These reach the container as
+# environment variables, where bin/entrypoint.sh rewrites them into
+# etc/conf/server.conf and etc/conf/persistence.conf and
+# common/util/app_config.py applies the REGISTRY_* ones directly.
+#   PERSISTENCE_MODE=postgresql      use the Cloud SQL instance below
+#   DB_HOST=/cloudsql/<connection>   Unix socket path, not a TCP host
+#   DB_PORT, DB_NAME, DB_USERNAME    generated above
+#   DB_POOL_MIN=2, DB_POOL_MAX=10    conservative pool for the db-f1-micro tier
+#   REGISTRY_ENABLE_HTTPS=false      Cloud Run terminates TLS in front of the container
+#   REGISTRY_FORWARDED_ALLOW_IPS=*   trust the platform front end (its address is not
+#                                    stable). Never use "*" for owner.trusted.proxy.ips
+#   REGISTRY_OWNER_VALIDATION_MODE=relaxed
+#   REGISTRY_OWNER_ISOLATION_ENABLED=false   no verified owner identity; this is what
+#   REGISTRY_VERIFY_CLIENT=false             makes the script development-only
+#   REGISTRY_SIGNATURE_VALIDATION_ENABLED=false
+#   REGISTRY_REGISTRY_SIGN_ENABLED=false
+# DB_PASSWORD is deliberately not listed here: it is injected from Secret Manager
+# by --set-secrets below so it never appears in the revision's plain env vars.
 $envVars = "PERSISTENCE_MODE=postgresql"
 $envVars += ",DB_HOST=/cloudsql/$CLOUDSQL_CONN"
 $envVars += ",DB_PORT=5432"
@@ -253,6 +303,10 @@ $envVars += ",REGISTRY_REGISTRY_SIGN_ENABLED=false"
 
 Write-Host "  DB_HOST: /cloudsql/$CLOUDSQL_CONN"
 
+# --port=8080 matches the image's REGISTRY_PORT default; Cloud Run injects PORT
+# with the same value, which the entrypoint normalizes back into REGISTRY_PORT.
+# --no-allow-unauthenticated keeps the demo reachable only with a Cloud Run IAM
+# identity token.
 $deployResult = gcloud run deploy "${SERVICE_NAME}" `
   --source=. `
   --region="$env:GCP_REGION" `

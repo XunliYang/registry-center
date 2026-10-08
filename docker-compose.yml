@@ -1,5 +1,29 @@
 # Local development only: anonymous access is restricted to the host loopback.
 # For production use verified caller identities and an explicit access policy.
+#
+# Configuration this file supplies, and where each value lands:
+#   build: .                      builds the image described in Dockerfile
+#   ports 127.0.0.1:5000:5000     publish on loopback only (REGISTRY_PORT below)
+#   volumes:
+#     ./data                      registry storage (file backend)
+#     ./etc/ssl                   TLS material; the image ships none
+#     ./etc/sign_cert             JWK signing material
+#     ./log                       logs and the local audit trail
+#     ${LLM_CONFIG_HOST_FILE}     model definitions, mounted read-only. Defaults to
+#                                 ./etc/config/models.yaml; if that host path does
+#                                 not exist Docker creates an empty directory in its
+#                                 place, and the service then starts with no model
+#                                 configured at all. The variable is read by Compose,
+#                                 not by the service.
+#   env_file: .env                secrets named by models.yaml `*_env` fields
+#   environment:                  REGISTRY_* overrides, applied by
+#                                 common/util/app_config.py after server.conf and
+#                                 server.properties are loaded
+#
+# etc/conf is intentionally not mounted: the container uses the copies the image
+# built from server.conf.example / persistence.conf.example and the entrypoint
+# rewrites the lines listed in bin/entrypoint.sh. Mount a prepared etc/conf
+# instead if you need server.properties or integration credentials.
 version: "3.8"
 
 services:

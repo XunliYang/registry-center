@@ -20,14 +20,21 @@ persistence.mode=file
 
 # PostgreSQL configuration (effective when persistence.mode=postgresql)
 postgresql.host=127.0.0.1
+# TCP port of the PostgreSQL server (default 5432)
 postgresql.port=5432
+# database name; created at startup if missing (the role needs CREATE privilege)
 postgresql.name=registry_center
+# login role (env DB_USERNAME; the file default is opena2a_t)
 postgresql.username=${DB_USERNAME:opena2a_t}
+# password: cipher_util enc:v1:... or plaintext; empty means no password
 postgresql.password=${DB_PASSWORD}
+# connections opened at startup and kept warm; keep <= pool.max (default 5)
 postgresql.pool.min=5
+# hard cap on open connections; a checkout beyond it fails at once (default 20)
 postgresql.pool.max=20
+# UNUSED: no code reads this key; psycopg2's pool has no wait timeout
 postgresql.pool.timeout=30
-# Seconds to wait for a TCP connection before failing (fast startup pre-check)
+# seconds to wait for one connection attempt (TCP + authentication, not queries); default 10
 postgresql.connect_timeout=${PG_CONNECT_TIMEOUT:10}
 
 # SQLite configuration (effective when persistence.mode=sqlite)
@@ -35,20 +42,92 @@ sqlite.path=${SQLITE_PATH:data/agents.db}
 
 # GaussDB configuration (effective when persistence.mode=gauss)
 gauss.host=${GAUSS_HOST:localhost}
+# TCP port of the GaussDB server (default 5432)
 gauss.port=${GAUSS_PORT:5432}
+# database name; created at startup if missing (the user needs CREATE privilege)
 gauss.database=${GAUSS_DATABASE:a2a_registry}
+# login role (env GAUSS_USER; the file default is a2a_user)
 gauss.username=${GAUSS_USER:a2a_user}
+# password: cipher_util enc:v1:... or plaintext; empty means no password
 gauss.password=${GAUSS_PASSWORD}
+# connections opened at startup and kept warm; keep <= pool.max (default 5)
 gauss.pool.min=${GAUSS_POOL_MIN:5}
+# hard cap on open connections; a checkout beyond it fails at once (default 20)
 gauss.pool.max=${GAUSS_POOL_MAX:20}
+# seconds to wait for one connection attempt (TCP + authentication, not queries); default 10
 gauss.connect_timeout=${GAUSS_CONNECT_TIMEOUT:10}
 
 # MySQL configuration (effective when persistence.mode=mysql, MySQL 5.7+/8.0)
 mysql.host=${MYSQL_HOST:localhost}
+# TCP port of the MySQL server (default 3306)
 mysql.port=${MYSQL_PORT:3306}
+# database name; created at startup if missing (the user needs CREATE privilege)
 mysql.name=${MYSQL_DATABASE:registry_center}
+# login role (env MYSQL_USER; the file default is a2a_user)
 mysql.username=${MYSQL_USER:a2a_user}
+# password: cipher_util enc:v1:... or plaintext; empty means no password
 mysql.password=${MYSQL_PASSWORD}
+# idle connections opened at startup and kept cached; keep <= pool.max (default 5)
 mysql.pool.min=${MYSQL_POOL_MIN:5}
+# hard cap on open connections; a caller beyond it waits, with no timeout (default 20)
 mysql.pool.max=${MYSQL_POOL_MAX:20}
+# seconds to wait for the TCP connect only (not the handshake or queries); default 10
 mysql.connect_timeout=${MYSQL_CONNECT_TIMEOUT:10}
+
+# ---------------- Audit sink to customer MySQL (all keys optional; defaults shown) ----------------
+# Mirrors third-party integration audit records into a MySQL database owned by the
+# operator. Independent of persistence.mode: this is a second connection and the
+# account belongs to the customer database, not to the registry storage backend.
+# Records come from the integration listener, so nothing is written while
+# integration.enabled=false.
+# The local audit file (log/audit/) is written first and stays authoritative. The
+# sink never blocks a request, drops its copy when its 10000-entry queue is full or
+# the database is unreachable (one warning per cause per 30s), and does not flush
+# what is still queued when the process exits.
+# Target account: INSERT plus CREATE TABLE on that database - the sink creates the
+# fixed table integration_audit_records on first connect and never migrates it.
+# Transport: the PyMySQL default, which attempts TLS and falls back to plaintext,
+# without verifying the server certificate; no ssl_* key exists here to tighten it.
+# Configuration form: ${VAR:default} placeholders resolved at load, so these values
+# read as defaults; AUDIT_MYSQL_* or REGISTRY_AUDIT_MYSQL_* overrides them. Keep the
+# keys as active lines even while disabled, because the REGISTRY_* reader only
+# rewrites names it already finds here - a missing or commented-out key would make
+# REGISTRY_AUDIT_MYSQL_* silently ineffective.
+# Keep comments on their own line: this file is read by configparser, which does not
+# strip trailing comments, so audit.mysql.port=3306 followed by a # note becomes that
+# whole string and aborts startup.
+
+# true enables the sink; false keeps audit records in the local file only
+audit.mysql.enabled=${AUDIT_MYSQL_ENABLED:false}
+# host name or address of the customer MySQL server
+audit.mysql.host=${AUDIT_MYSQL_HOST:localhost}
+# TCP port of the customer MySQL server
+audit.mysql.port=${AUDIT_MYSQL_PORT:3306}
+# database that receives integration_audit_records
+audit.mysql.name=${AUDIT_MYSQL_DATABASE:registry_center}
+# dedicated minimal-privilege account on that database
+audit.mysql.username=${AUDIT_MYSQL_USERNAME:a2a_user}
+# cipher_util value (enc:v1:...) or plaintext; empty means no password
+audit.mysql.password=${AUDIT_MYSQL_PASSWORD}
+# seconds to wait for the TCP connect only; PyMySQL resets the socket timeout before the
+# handshake, so a server that accepts TCP but stalls is not bounded by this (default 10)
+audit.mysql.connect_timeout=${AUDIT_MYSQL_CONNECT_TIMEOUT:10}
+# rows per INSERT batch (bounded by the 10000-entry queue)
+audit.mysql.batch_size=${AUDIT_MYSQL_BATCH_SIZE:50}
+# idle poll interval and pause after a failed write, in seconds (decimals allowed)
+audit.mysql.flush_interval=${AUDIT_MYSQL_FLUSH_INTERVAL:2}
+
+# ---------------- Knowledge graph API backend (optional) ----------------
+# Read by the graph API only, from the persistence snapshot taken when the service
+# starts, so a change needs a restart. The graph API answers HTTP 404 unless
+# knowledge_graph.enabled=true is set in server.conf, and its rate limit and owner
+# allowlist live in server.properties. Independent of persistence.mode: the AgentCard
+# store is unaffected by these keys.
+# Bolt URI of the Neo4j instance (default bolt://localhost:7687); neo4j:// enables
+# cluster routing.
+neo4j.uri=${NEO4J_URI:bolt://localhost:7687}
+# Neo4j login name (default neo4j).
+neo4j.username=${NEO4J_USERNAME:neo4j}
+# Neo4j password. Empty makes every graph call return HTTP 503 "Neo4j credentials are
+# not configured"; the value is used as-is, without cipher_util decryption.
+neo4j.password=${NEO4J_PASSWORD}
