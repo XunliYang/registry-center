@@ -25,17 +25,16 @@ umask 077
 #
 # Any other REGISTRY_* variable is deliberately not rewritten into a file here:
 # common/util/app_config.py applies REGISTRY_* overrides to the loaded
-# configuration itself (REGISTRY_FOO_BAR -> foo.bar or foobar). Overrides only
-# take effect for keys that already exist in server.conf or server.properties,
-# and only when the underscored variable name maps back onto the key exactly:
-# a key containing an underscore after a dot (integration.auth.static.hmac_key,
-# integration.auth.fingerprint_key, integration.oauth2.client_id, jwks_uri,
-# ca_file, integration.token.allowed_scopes, knowledge_graph.ratelimit,
-# audit.mysql.batch_size ...) is NOT reachable this way, because every
-# underscore becomes a dot and the value lands on a name no consumer reads.
-# Configure those keys in the file, or through the ${ENV_VAR} placeholders the
-# file already contains (INTEGRATION_FINGERPRINT_KEY, INTEGRATION_TOKEN_HMAC_KEY,
-# OAUTH_INTROSPECTION_CLIENT_ID/SECRET, AUDIT_MYSQL_*, ...), not with REGISTRY_*.
+# configuration itself. The canonical name is REGISTRY_ + the uppercase key,
+# with dots replaced by underscores (internal underscores are preserved).
+# For example REGISTRY_INTEGRATION_AUTH_STATIC_HMAC_KEY and
+# REGISTRY_AUDIT_MYSQL_BATCH_SIZE target the corresponding dotted keys.
+# Keys declared in the shipped server.conf.example/persistence.conf.example
+# remain reachable even when omitted from an older deployment's file; template
+# values are NOT adopted as defaults. Other custom keys must be declared in the
+# loaded file. REGISTRY_* takes precedence over file values.
+# Main listener settings do not parse ${ENV_VAR} placeholders: use literal
+# values or REGISTRY_*; persistence and integration consumers resolve them.
 
 # Reject unsupported serve flags before touching configuration. Additional
 # commands retain the standard container pass-through behavior.

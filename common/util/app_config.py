@@ -19,7 +19,7 @@
 import configparser
 import os
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Iterable
 
 from loguru import logger
 
@@ -42,7 +42,9 @@ def get_conf() -> Dict[str, Any]:
     server.conf holds feature switches and deployment/access settings;
     server.properties holds operating parameters and business policies.
     Preserve legacy file precedence; diagnose duplicate keys without logging values.
-    REGISTRY_* environment overrides are applied last.
+    REGISTRY_* environment overrides are applied last. The public template
+    declares key names for overrides even when an older deployment file omits
+    them; its example values are never loaded as runtime defaults.
     Returns:
         A dictionary containing all configurations.
     """
@@ -61,7 +63,7 @@ def get_conf() -> Dict[str, Any]:
             "server.properties takes precedence.", ", ".join(sorted(duplicates))
         )
     config.update(policies)
-    apply_env_overrides(config)
+    apply_env_overrides(config, _declared_keys(base_config_path + '.example'))
     return config
 
 
@@ -115,24 +117,40 @@ def canonical_env_name(key: str) -> str:
     return "REGISTRY_" + key.upper().replace(".", "_")
 
 
-def apply_env_overrides(conf: Dict[str, Any]) -> None:
+def _declared_keys(template_path: str) -> Iterable[str]:
+    """Read override key names, not defaults, from a shipped public template.
+
+    Minimal/custom installations without a template retain legacy behaviour.
+    Never rewrite the operator's configuration to add missing declarations.
+    """
+    declared = {}
+    if os.path.isfile(template_path):
+        load_configs(template_path, declared)
+    return declared.keys()
+
+
+def apply_env_overrides(conf: Dict[str, Any], known_keys: Iterable[str] = ()) -> None:
     """
     Override config values with REGISTRY_* environment variables.
 
     Env var REGISTRY_FOO_BAR overrides config key 'foo.bar' or 'foobar', and
     every key is also reachable under its canonical spelling (see
     canonical_env_name), so a key like 'integration.auth.static.hmac_key'
-    cannot be silently missed. A name that matches no key is stored under its
-    raw lowercase form, which handlers that read such names expect.
+    cannot be silently missed. ``known_keys`` supplies declarations from the
+    public template so missing file entries remain reachable without adopting
+    example defaults. Existing deployment/plugin keys remain reachable too.
+    A name that matches no key is stored under its raw lowercase form, which
+    handlers that read such names expect.
     """
     env_prefix = "REGISTRY_"
     canonical = {}
     # Dotted keys are registered first: when one name is the canonical spelling
     # of both 'foo.bar' and a legacy 'foo_bar' key, the dotted key wins.
-    for key in conf:
+    keys = dict.fromkeys((*conf, *known_keys))
+    for key in keys:
         if '.' in key:
             canonical.setdefault(canonical_env_name(key), key)
-    for key in conf:
+    for key in keys:
         canonical.setdefault(canonical_env_name(key), key)
     for env_key, env_value in os.environ.items():
         if not env_key.startswith(env_prefix):
@@ -184,7 +202,7 @@ def get_persistence_conf() -> dict:
     persistence_conf_path = os.path.join(root_path, "etc", "conf", "persistence.conf")
     conf = load_conf_as_dict(persistence_conf_path)
     conf = _resolve_env_vars(conf)
-    apply_env_overrides(conf)
+    apply_env_overrides(conf, _declared_keys(persistence_conf_path + '.example'))
     if 'postgresql.password' in conf and conf['postgresql.password']:
         from common.util.cipher_util import decrypt
         decrypted = decrypt(conf['postgresql.password'])

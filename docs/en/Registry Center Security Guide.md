@@ -234,7 +234,7 @@ For custom implementation, refer to the [Registry Center Development Guide "Cust
 In addition to the local audit file, `audit.mysql.*` in `etc/conf/persistence.conf` archives third-party audit records asynchronously into the operator's MySQL database (table `integration_audit_records`):<br>
 - Disabled by default (`audit.mysql.enabled=false`).<br>
 - The local audit file remains the authoritative record; a failed archive only logs a warning and degrades to local-only without blocking business requests.<br>
-- `REGISTRY_AUDIT_MYSQL_*` environment overrides apply while the keys stay as active lines in the file; a commented-out or missing key never receives an override.<br>
+- `REGISTRY_AUDIT_MYSQL_*` overrides target keys declared in the shipped `persistence.conf.example`, even if omitted or commented out in the deployment file; template values are not imported as defaults.<br>
 - `audit.mysql.password` accepts an encrypted value (`enc:v1:` prefix) or plaintext; empty means no password.<br>
 
 ## AgentCard Content Security

@@ -1035,12 +1035,23 @@ Note: the owner/identity rows above are the values shipped in the sample
 `owner.identity.mode=certificate`; see the
 [Security Guide](Registry%20Center%20Security%20Guide.md).
 
-Note: values in `server.conf` and `persistence.conf` may use the `${VAR:default}`
-placeholder mechanism described in
-[Configuration example (MySQL)](#configuration-example-mysql). A dotted key must stay an
-ACTIVE (uncommented) line for its `REGISTRY_*` override to be applied, because the override
-reader only rewrites keys it already finds in the file; an underscored key such as `IP`,
-`PORT` or `enable_https` is added from the raw environment name either way.
+Note: `${VAR:default}` placeholders are resolved by the persistence loader and by
+the integration consumers that explicitly support them; `${VAR}` without a default
+resolves to an empty value. The main listener does **not** expand placeholders:
+use literal values or `REGISTRY_*` for `enable_https`, `IP`, `PORT` and TLS paths
+(for example, `enable_https=true` or `REGISTRY_ENABLE_HTTPS=true`, not
+`enable_https=${DEPLOY_HTTPS:true}`). See
+[Configuration example (MySQL)](#configuration-example-mysql) for persistence.
+
+The canonical override name is `REGISTRY_` followed by the uppercase key with dots
+replaced by underscores; internal underscores are preserved (for example,
+`integration.auth.static.hmac_key` becomes `REGISTRY_INTEGRATION_AUTH_STATIC_HMAC_KEY`).
+Keys declared in the shipped `server.conf.example` can be overridden even if absent
+or commented out in an older `server.conf`, including in direct Python/systemd
+deployments. The template declares **names only**, not runtime defaults; it never
+rewrites the operator's file or automatically enables a feature. Custom/plugin keys
+remain overridable when declared in the loaded file. Keep the public templates in
+the installation alongside the configuration files.
 
 #### persistence.conf Configuration Items
 
@@ -1089,8 +1100,11 @@ reader only rewrites keys it already finds in the file; an underscored key such 
 | neo4j.password | Neo4j password, used as-is (no `cipher_util` decryption); empty makes every graph call return 503 | `${NEO4J_PASSWORD}` (empty) |
 
 Note: archiving is disabled by default, the local audit file remains the authoritative
-record, and a failed archive only logs a warning and degrades to local-only. The keys must
-stay as active lines in `persistence.conf` for `REGISTRY_AUDIT_MYSQL_*` overrides to apply.
+record, and a failed archive only logs a warning and degrades to local-only. Keys
+declared in the shipped `persistence.conf.example` receive `REGISTRY_AUDIT_MYSQL_*`
+overrides even if omitted or commented out in `persistence.conf`; example values
+are not imported as defaults. Persistence file placeholders are resolved before
+`REGISTRY_*` overrides and password decryption.
 
 #### server.properties Configuration Items (Operating Parameters and Business Policies)
 
@@ -1126,7 +1140,7 @@ stay as active lines in `persistence.conf` for `REGISTRY_AUDIT_MYSQL_*` override
 | tag.max.count | Upper bound on tags per agent card; the set-tags operation rejects a larger merged tag set | 10 |
 | tag.max.length | Maximum characters per tag; allowed characters are Chinese, A-Z a-z, digits, dot, underscore and hyphen | 50 |
 | heartbeat.interval | Expected seconds between agent heartbeats (min 1); also returned to agents in the heartbeat reply | 30 |
-| heartbeat.failure.threshold | Multiplier on `heartbeat.interval` before a silent agent is flagged suspect (min 1) | 3 |
+| heartbeat.failure.threshold | Offline boundary multiplier (min 1): offline after `interval * threshold + grace`; suspect starts after `interval + grace` independently of this value (threshold=1 skips suspect) | 3 |
 | heartbeat.grace.period | Extra seconds added to every health window to absorb jitter (min 0) | 10 |
 | heartbeat.sweep.interval | Seconds between background health sweeps (min 1); lower values detect status changes sooner | 10 |
 | heartbeat.offline.ttl | Seconds an offline agent is kept before auto-deregistration (min 0; 0 = never auto-remove) | 0 |
@@ -1136,7 +1150,7 @@ stay as active lines in `persistence.conf` for `REGISTRY_AUDIT_MYSQL_*` override
 | broadcast.webhook.max.retries | Retries inside one delivery batch, so total in-process attempts = retries + 1 | 5 |
 | broadcast.webhook.backoff.base | Seconds for the first retry delay; the delay is base x 2^attempt with +/-30% jitter | 2 |
 | broadcast.webhook.backoff.max | Upper bound in seconds on the exponential retry delay | 300 |
-| broadcast.outbox.retention.days | Days an event is kept in the outbox; an hourly cleanup deletes older rows, bounding replay after an outage | 7 |
+| broadcast.outbox.retention.days | Event retention days; cleanup runs every 3600 flusher iterations (approximately `3600 * debounce.window` seconds plus processing, about two hours by default); expired rows may remain until cleanup | 7 |
 | broadcast.delivery.max.attempts | Total delivery attempts per subscription and event across restarts (min 1); once spent, the delivery is abandoned | 5 |
 | broadcast.delivery.retry.interval | Seconds between sweeps that requeue failed deliveries; 0 disables the sweep task | 60 |
 | integration.ratelimit | Requests per second allowed for one authenticated credential on the integration port, written as `N/second` or a bare N; excess returns HTTP 429 | 100/second |
