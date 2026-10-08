@@ -99,6 +99,13 @@ def _query_batches(client, collection_name: str, output_fields: List[str],
                    batch_size: int) -> Iterable[List[dict]]:
     """Yield query batches using Milvus' iterator API when available."""
 
+    # A real Milvus collection may be released after the client reconnects.
+    # Loading it here keeps migration usable after a restart and is a no-op
+    # for the lightweight test doubles that do not expose load_collection.
+    load_collection = getattr(client, "load_collection", None)
+    if load_collection:
+        load_collection(collection_name=collection_name)
+
     query_filter = 'id != ""'
     if hasattr(client, "query_iterator"):
         iterator = client.query_iterator(

@@ -45,12 +45,16 @@ class _MilvusDouble:
         self.entities = entities
         self.upserted = []
         self.inserted = []
+        self.loaded = []
 
     def has_collection(self, collection_name):
         return collection_name in self.schemas
 
     def describe_collection(self, collection_name):
         return self.schemas[collection_name]
+
+    def load_collection(self, collection_name):
+        self.loaded.append(collection_name)
 
     def query_iterator(self, collection_name, batch_size, filter, output_fields):
         del batch_size, filter
@@ -105,6 +109,7 @@ def test_in_place_migration_backfills_unknown_and_preserves_embedding():
     assert result.unknown_assigned == 1
     assert client.upserted == [{**_entity("legacy"), "layer": "unknown"}]
     assert client.entities["agents"][1]["embedding"] == [0.1, 0.2]
+    assert client.loaded == ["agents"]
 
 
 def test_in_place_migration_preserves_vendor_defined_layer():
@@ -151,6 +156,7 @@ def test_rebuild_migration_copies_legacy_entities_to_layer_aware_collection():
         "unknown", "unknown"
     ]
     assert all(row["embedding"] == [0.1, 0.2] for row in client.entities["layer_agents"])
+    assert client.loaded == ["legacy_agents"]
 
 
 def test_rebuild_dry_run_scans_without_creating_or_writing_target():
