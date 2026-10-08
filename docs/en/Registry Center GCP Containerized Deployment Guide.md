@@ -19,6 +19,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Registry Center - Google Cloud Platform Containerized Deployment Guide
 
+This script is **development-only**, not a production owner-identity deployment.
+Without `-DevelopmentOnly` it fails before creating cloud resources. The demo
+explicitly disables owner isolation/signing and requires Cloud Run IAM access
+(`--no-allow-unauthenticated`). For production use mTLS or a separately configured
+verified identity gateway; see [Container deployment](../container-deployment.md).
+
+
 This guide walks you through deploying the Registry Center service to Google Cloud Platform **step by step** — no technical background required.
 
 ---
@@ -79,7 +86,7 @@ Open PowerShell (right-click Start → "Windows PowerShell" or "Terminal"), then
 
 ```powershell
 cd <project-directory-path>
-.\deploy-all.ps1
+.\deploy-all.ps1 -DevelopmentOnly
 ```
 
 > Replace `<project-directory-path>` with the actual path to the `registry-center` folder. For example:
@@ -87,15 +94,15 @@ cd <project-directory-path>
 > cd C:\Users\YourUsername\Desktop\registry-center
 > ```
 
-> **If running `.\deploy-all.ps1` fails with the error** "File ... cannot be loaded. The file ... is not digitally signed. You cannot run this script on the current system." / "UnauthorizedAccess", this is caused by PowerShell's Execution Policy, which by default blocks unsigned scripts. Choose one of the following solutions:
+> **If running `.\deploy-all.ps1 -DevelopmentOnly` fails with the error** "File ... cannot be loaded. The file ... is not digitally signed. You cannot run this script on the current system." / "UnauthorizedAccess", this is caused by PowerShell's Execution Policy, which by default blocks unsigned scripts. Choose one of the following solutions:
 > - **Option 1 (Recommended, permanent)**: Loosen the execution policy for your user account. Local scripts can run directly; only scripts downloaded from the internet require a signature.
 >   ```powershell
 >   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 >   ```
->   Then run `.\deploy-all.ps1` again.
+>   Then run `.\deploy-all.ps1 -DevelopmentOnly` again.
 > - **Option 2 (one-time only)**: Bypass the execution policy for a single run without changing system settings.
 >   ```powershell
->   powershell -ExecutionPolicy Bypass -File .\deploy-all.ps1
+>   powershell -ExecutionPolicy Bypass -File .\deploy-all.ps1 -DevelopmentOnly
 >   ```
 
 You will be prompted to enter:
@@ -120,12 +127,13 @@ The script will then automatically:
 
 The script outputs a `https://xxxxx.run.app` URL at the end — this is your service URL.
 
-Open `https://xxxxx.run.app/rest/v1/registry-center/agent-cards` in your browser. If you see `{"agentCards":[]}`, the service is running normally (an empty list means no agents have been registered yet).
+Use an authorized Cloud Run invoker identity token. Anonymous browser requests are denied by the platform. `{"agentCards":[]}` means the service is reachable and no agents have been registered.
 
 Alternatively, test with PowerShell:
 
 ```powershell
-Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-cards"
+$identityToken = gcloud auth print-identity-token
+Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-cards" -Headers @{ Authorization = "Bearer $identityToken" }
 ```
 
 ---
@@ -134,8 +142,8 @@ Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-card
 
 `etc/config/models.yaml` is deliberately not built into the image (it is listed in
 `.dockerignore`), so a fresh container has no model definition. The service still starts and serves
-requests, but every LLM-backed feature stays unavailable — semantic Agent matching returns
-`{"agentCards":[]}`, which is indistinguishable from "no match".
+requests. A request that needs an unavailable model returns HTTP 503; an empty candidate
+set can return `{"agentCards":[]}` without invoking the model.
 
 Two ways to supply the file:
 
@@ -194,15 +202,15 @@ Close PowerShell and reopen it. If it still doesn't work, gcloud isn't installed
 
 **Q: I see "API has not been used" error?**
 
-Wait 1–2 minutes and run `.\deploy-all.ps1` again. Some APIs take time to activate.
+Wait 1–2 minutes and run `.\deploy-all.ps1 -DevelopmentOnly` again. Some APIs take time to activate.
 
 **Q: The deployment failed. How do I retry?**
 
-Simply run `.\deploy-all.ps1` again. Already-created resources will be automatically skipped.
+Simply run `.\deploy-all.ps1 -DevelopmentOnly` again. Already-created resources will be automatically skipped.
 
 **Q: How do I update the service?**
 
-After making code changes, run `.\deploy-all.ps1` again to update.
+After making code changes, run `.\deploy-all.ps1 -DevelopmentOnly` again to update.
 
 **Q: How do I shut down the service (to save costs)?**
 

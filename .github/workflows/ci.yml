@@ -7,6 +7,14 @@ on:
     branches: [main, master]
 
 jobs:
+  container-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image and exercise real container startup
+        run: python3 tests/container_smoke.py
+
   backend-tests:
     runs-on: ubuntu-latest
     steps:
@@ -21,6 +29,8 @@ jobs:
         run: pytest tests/ -v --tb=short
         env:
           PYTHONPATH: .
+      - name: Start registry and verify OAuth integration over HTTPS
+        run: python tests/integration_oauth_smoke.py
 
   frontend-lint:
     runs-on: ubuntu-latest

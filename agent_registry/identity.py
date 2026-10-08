@@ -219,6 +219,11 @@ def identity_configuration_warnings(config: Dict[str, Any]) -> Sequence[str]:
     if not isolation:
         return warnings
     if source == CERTIFICATE:
+        if str((config or {}).get('enable_https', 'true')).lower() == 'false':
+            warnings.append(
+                "owner.isolation.enabled=true with owner.identity.mode=certificate but "
+                "enable_https=false: an HTTP listener cannot verify TLS peer certificates. "
+                "Enable HTTPS with mTLS or configure a verified trusted proxy identity source.")
         if str((config or {}).get('verify_client', 'true')).lower() == 'false':
             warnings.append(
                 "owner.isolation.enabled=true with owner.identity.mode=certificate but "

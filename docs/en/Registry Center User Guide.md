@@ -264,7 +264,7 @@ agent-registry>
 | gauss.* | GaussDB connection: host/port/database/username/password/pool.min/pool.max/connect_timeout | localhost:5432 |
 | mysql.* | MySQL connection: host/port/name/username/password/pool.min/pool.max/connect_timeout | localhost:3306 |
 
-### Advanced Configuration (etc/conf/server.properties)
+### Operating Parameters and Business Policies (etc/conf/server.properties)
 
 | Configuration Item | Description | Default |
 |--------------------|-------------|---------|
@@ -272,39 +272,39 @@ agent-registry>
 | connection.max | Maximum active HTTP responses, including the complete SSE lifetime; not an OS TCP socket count | 500 |
 | connection.timeout | Timeout (seconds) | 300 |
 
-### Heartbeat Detection Configuration (etc/conf/server.conf)
+### Heartbeat Detection Configuration
 
 Agents periodically report liveness, and the Registry Center determines health status based on the failure threshold. All settings can be overridden with `REGISTRY_`-prefixed environment variables (for example, `REGISTRY_HEARTBEAT_INTERVAL`).
 
-| Configuration Item | Description | Default |
-|--------|------|--------|
-| heartbeat.enabled | Heartbeat detection master switch; when off, behavior matches legacy versions | false |
-| heartbeat.interval | Expected heartbeat period (seconds), advertised to Agents in the heartbeat response | 30 |
-| heartbeat.failure.threshold | Consecutive missed periods before an Agent is marked offline | 3 |
-| heartbeat.grace.period | Suspect-state buffer duration (seconds) | 10 |
-| heartbeat.sweep.interval | Background sweep period (seconds) | 10 |
-| heartbeat.offline.ttl | Auto-deregister Agents offline longer than this (0 = disabled) | 0 |
-| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from **task-discovery** query results (the health list/history/SSE always show them, so offline alerts stay visible) | false |
-| flowcontrol.ratelimit.heartbeat | Heartbeat API rate limit (requests/second/IP) | 100 |
+| Configuration Item | Description | Default | File |
+|--------|------|--------|------|
+| heartbeat.enabled | Heartbeat detection master switch; when off, behavior matches legacy versions | false | `server.conf` |
+| heartbeat.interval | Expected heartbeat period (seconds), advertised to Agents in the heartbeat response | 30 | `server.properties` |
+| heartbeat.failure.threshold | Consecutive missed periods before an Agent is marked offline | 3 | `server.properties` |
+| heartbeat.grace.period | Suspect-state buffer duration (seconds) | 10 | `server.properties` |
+| heartbeat.sweep.interval | Background sweep period (seconds) | 10 | `server.properties` |
+| heartbeat.offline.ttl | Auto-deregister Agents offline longer than this (0 = disabled) | 0 | `server.properties` |
+| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from **task-discovery** query results (the health list/history/SSE always show them, so offline alerts stay visible) | false | `server.conf` |
+| flowcontrol.ratelimit.heartbeat | Heartbeat API rate limit (requests/second/IP) | 100 | `server.properties` |
 
-### Change Broadcast Configuration (etc/conf/server.conf)
+### Change Broadcast Configuration
 
 Registry changes (registration/update/deregistration/health changes) are pushed to subscribers via webhooks. Events are persisted before dispatch, so a Registry Center restart never loses them; subscribers can catch up by version through the change reconciliation API.
 
-| Configuration Item | Description | Default |
-|--------|------|--------|
-| broadcast.enabled | Broadcast master switch | false |
-| broadcast.debounce.window | Batch window (seconds); retains each durable event ID in version order | 2 |
-| broadcast.max.events.per.second | Per-subscription delivery rate limit (overflow degrades to a summary event) | 50 |
-| broadcast.webhook.timeout | Delivery timeout (seconds) | 10 |
-| broadcast.webhook.max.retries | Maximum retries (exponential backoff) | 5 |
-| broadcast.webhook.backoff.base | Backoff base (seconds) | 2 |
-| broadcast.webhook.backoff.max | Backoff cap (seconds) | 300 |
-| broadcast.delivery.max.attempts | Attempt budget for durable retry of failed deliveries; once spent, the delivery stays failed in the internal ledger (`/changes` returns event content for reconciliation, not delivery status) | 5 |
-| broadcast.delivery.retry.interval | Seconds between durable retry sweeps (also swept once at startup) | 60 |
-| broadcast.outbox.retention.days | Event retention days | 7 |
-| broadcast.allow.http.callbacks | Whether HTTP callbacks are allowed (development only) | false |
-| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names); mandatory before subscriptions can be created | empty (fails closed) |
+| Configuration Item | Description | Default | File |
+|--------|------|--------|------|
+| broadcast.enabled | Broadcast master switch | false | `server.conf` |
+| broadcast.debounce.window | Batch window (seconds); retains each durable event ID in version order | 2 | `server.properties` |
+| broadcast.max.events.per.second | Per-subscription delivery rate limit (overflow degrades to a summary event) | 50 | `server.properties` |
+| broadcast.webhook.timeout | Delivery timeout (seconds) | 10 | `server.properties` |
+| broadcast.webhook.max.retries | Maximum retries (exponential backoff) | 5 | `server.properties` |
+| broadcast.webhook.backoff.base | Backoff base (seconds) | 2 | `server.properties` |
+| broadcast.webhook.backoff.max | Backoff cap (seconds) | 300 | `server.properties` |
+| broadcast.delivery.max.attempts | Attempt budget for durable retry of failed deliveries; once spent, the delivery stays failed in the internal ledger (`/changes` returns event content for reconciliation, not delivery status) | 5 | `server.properties` |
+| broadcast.delivery.retry.interval | Seconds between durable retry sweeps (also swept once at startup) | 60 | `server.properties` |
+| broadcast.outbox.retention.days | Event retention days | 7 | `server.properties` |
+| broadcast.allow.http.callbacks | Whether HTTP callbacks are allowed (development only) | false | `server.conf` |
+| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names); mandatory before subscriptions can be created | empty (fails closed) | `server.conf` |
 
 The in-process wake-up queue holds at most 1,024 hints; the dispatcher caches
 at most 1,024 subscriber/event pairs. Each subscriber has one queued batch and

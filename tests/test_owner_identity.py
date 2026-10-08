@@ -506,6 +506,18 @@ class TestStrictStartupIdentity:
 
         assert strict_startup_failures(config) == []
 
+    def test_http_listener_cannot_supply_certificate_identity(self):
+        config = dict(self.BROKEN_CERTIFICATE_CONFIG, verify_client='true', enable_https='false')
+        failures = strict_startup_failures(config)
+        assert len(failures) == 1
+        assert 'enable_https=false' in failures[0]
+
+    def test_http_with_verified_proxy_identity_passes(self):
+        config = dict(self.BROKEN_CERTIFICATE_CONFIG, enable_https='false')
+        config.update({'owner.identity.mode': TRUSTED_PROXY,
+                       'owner.trusted.proxy.ips': '127.0.0.1'})
+        assert strict_startup_failures(config) == []
+
     def test_misconfiguration_is_reported(self):
         failures = strict_startup_failures(self.BROKEN_CERTIFICATE_CONFIG)
 

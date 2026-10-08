@@ -1,0 +1,123 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# All Rights Reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+# Feature switches and deployment/access settings only.
+# Operating parameters and business policies belong in server.properties.
+# Keep each key in one file; REGISTRY_* environment overrides are applied last.
+
+# Listening IP, default 127.0.0.1, configurable
+IP=127.0.0.1
+
+# Server port, default 5000, configurable
+PORT=5000
+
+# Enable HTTPS
+enable_https=true
+
+# Identity certificate, only cer format supported
+ssl_certfile=etc/ssl/server.cer
+
+# Private key file, only pem format supported
+ssl_keyfile=etc/ssl/server_key.pem
+
+# Private key file password
+ssl_keyfile_password=etc/ssl/cert_pwd
+
+# Trust certificate, only cer format supported
+ssl_ca_certs=etc/ssl/trust.cer
+
+# Revocation list
+#ssl_crl_file=etc/ssl/revocationlist.crl
+
+# Registry signature configuration required
+registry.sign.enabled=true
+
+# Verify client certificate
+verify_client=true
+
+forwarded_allow_ips=127.0.0.1
+
+# Downloading JWK certificate path
+jwk_cert_path=etc/ssl/server.cer
+
+# Private certificate file path
+jwk_private_key_path=etc/sign_cert
+
+jwk_private_key_password=''
+
+# Enable vector database
+use_vectordb=False
+
+# Enable signature validation capability
+signature_validation_enabled=true
+
+# JWK allowlist for signer-supplied jku key lookup (CWE-863).
+# Comma-separated hostnames that may be used as jku in AgentCard signatures,
+# e.g.  jwk_allowlist=keys.example.com,keys.example.org
+# When empty (default), the jku path is DISABLED (fail closed): no external key
+# material is fetched from card-controlled URLs and only backend keys are used.
+# Overridable via REGISTRY_JWK_ALLOWLIST.
+jwk_allowlist=
+
+# Enable agent approval capability
+agent_approval_enabled=false
+
+# Enable owner management logic
+owner.isolation.enabled=true
+
+# Owner validation mode
+# strict: strict validation, CN must be valid format
+# relaxed: relaxed mode, CN can be empty
+owner.validation.mode=relaxed
+
+# Certificate identity requires HTTPS with client verification.
+owner.identity.mode=certificate
+owner.trusted.proxy.ips=
+# Containers enable this via REGISTRY_STARTUP_STRICT_IDENTITY=true.
+startup.strict.identity=false
+
+# Optional third-party HTTPS listener; independent from main-port identity.
+integration.enabled=false
+integration.ip=127.0.0.1
+integration.port=5001
+integration.client_cert=false
+# Recommended when revocation/validity must be checked with IAM on every request.
+integration.auth.mode=oauth2_introspection
+integration.auth.fingerprint_key=${INTEGRATION_FINGERPRINT_KEY}
+integration.oauth2.introspection_uri=https://iam.example.com/oauth2/introspect
+# Registry's own validation credentials: NOT the calling client's credentials.
+integration.oauth2.client_id=${OAUTH_INTROSPECTION_CLIENT_ID}
+integration.oauth2.client_secret=${OAUTH_INTROSPECTION_CLIENT_SECRET}
+integration.oauth2.issuer=https://iam.example.com
+integration.oauth2.audience=registry-center
+# Empty CA file uses system roots; private CA must be mounted explicitly.
+integration.oauth2.ca_file=
+
+# Optional acquisition proxy. IAM authenticates each caller's own HTTP Basic credentials.
+integration.token.enabled=false
+integration.token.provider=oauth2_client_credentials
+integration.token.endpoint=https://iam.example.com/oauth2/token
+# Fixed, non-sensitive endpoint query parameters are allowed; never put credentials in URLs.
+integration.token.ca_file=
+
+# Optional heartbeat and change-notification features; timing/retry policies in server.properties.
+heartbeat.enabled=false
+heartbeat.hide.unhealthy.results=false
+broadcast.enabled=false
+broadcast.allow.http.callbacks=false
+# Comma-separated permitted callback hosts; empty rejects all subscriptions.
+broadcast.callback.allowlist=

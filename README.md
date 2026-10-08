@@ -106,6 +106,9 @@ python -m agent_registry.init    # choose: enable_https = false
 python -m agent_registry.start   # starts on http://127.0.0.1:5000
 ```
 
+For Docker/Podman packaging, runtime secret mounts, port precedence and
+non-interactive initialization, see [Container deployment](docs/container-deployment.md).
+
 ### Register Your First Agent
 
 ```bash
@@ -199,11 +202,20 @@ See the [API Reference](docs/en/Registry%20Center%20API%20Reference.md) for full
 
 | Config File | Purpose |
 |-------------|---------|
-| `etc/conf/server.conf` | Server IP, port, TLS certificates, signing, approval, owner isolation |
-| `etc/conf/server.properties` | TLS versions, ciphers, connection/timeout/rate limits |
+| `etc/conf/server.conf` | Feature switches and deployment/access settings: IP, port, TLS/credential references, IAM endpoints and identity modes |
+| `etc/conf/server.properties` | Operating parameters and business policies: TLS versions/ciphers, limits, heartbeat timing, notification retry and OAuth cache/scope policies |
 | `etc/conf/persistence.conf` | Storage backend: `file` (default), `postgresql` |
 | `etc/conf/log_config.conf` | Audit log rotation (size, backup count) |
 | `.env` | Local secrets (gitignored); model definitions live in `etc/config/models.yaml` |
+
+Define each key in only one server file. Loading order remains `server.conf` →
+`server.properties` → `REGISTRY_*` environment overrides. Duplicate definitions
+produce a warning containing key names only; historical last-loaded precedence
+is preserved for existing deployments. When migrating policies from `server.conf`,
+move their **effective values**, not template defaults, into `server.properties`,
+then remove the old definitions. The initialization wizard only edits deployment
+and feature settings. The image initializes from `server.conf.example` plus the
+public `server.properties`; local deployment files and secrets are not image inputs.
 
 Model definitions live in the gitignored `etc/config/models.yaml` (copy
 [`models.yaml.example`](etc/config/models.yaml.example)), while secrets come

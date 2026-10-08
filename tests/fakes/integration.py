@@ -135,5 +135,5 @@ class StubAuthnHandler(BaseHandler):
 
 def make_third_party_principal(role, identity="svc_app", owner=None) -> Principal:
     return Principal(client_ip="10.1.1.9", identity=identity,
-                     caller_type=CallerType.THIRD_PARTY, role=role,
+                     caller_type=CallerType.INTEGRATION, role=role,
                      auth_method=AUTH_METHOD_TOKEN, owner=owner or identity)

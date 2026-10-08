@@ -39,7 +39,10 @@ def get_root_path() -> str:
 def get_conf() -> Dict[str, Any]:
     """
     Load all server configurations.
-    File configs are loaded first, then REGISTRY_* env vars override them.
+    server.conf holds feature switches and deployment/access settings;
+    server.properties holds operating parameters and business policies.
+    Preserve legacy file precedence; diagnose duplicate keys without logging values.
+    REGISTRY_* environment overrides are applied last.
     Returns:
         A dictionary containing all configurations.
     """
@@ -48,7 +51,16 @@ def get_conf() -> Dict[str, Any]:
     base_config_path = os.path.join(root_path, "etc", "conf", "server.conf")
     safe_config_path = os.path.join(root_path, "etc", "conf", "server.properties")
     load_configs(base_config_path, config)
-    load_configs(safe_config_path, config)
+    policies = {}
+    load_configs(safe_config_path, policies)
+    duplicates = config.keys() & policies.keys()
+    if duplicates:
+        logger.warning(
+            "Duplicate server configuration keys across server.conf and "
+            "server.properties: {}. Keep each key in one file; "
+            "server.properties takes precedence.", ", ".join(sorted(duplicates))
+        )
+    config.update(policies)
     apply_env_overrides(config)
     return config
 
@@ -72,7 +84,14 @@ def load_configs(conf_path, config):
                 key = key.strip()
                 value = value.strip()
 
-                config[key.lower()] = value
+                key = key.lower()
+                if key in config:
+                    logger.warning(
+                        "Duplicate configuration key in {}: {}. "
+                        "Keep one definition; the last definition takes precedence.",
+                        os.path.basename(conf_path), key,
+                    )
+                config[key] = value
 
 
 def load_conf_as_dict(conf_file: str) -> dict:

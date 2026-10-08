@@ -7,15 +7,25 @@
 #   3. Builds and deploys to Cloud Run
 #
 # USAGE:  Just run this script in PowerShell:
-#   .\deploy-all.ps1
+#   .\deploy-all.ps1 -DevelopmentOnly
 #
 # You will be prompted for your GCP Project ID and a database password.
 # =============================================================================
 
 param(
     [string]$ServiceName = "",
-    [string]$GCPProjectID = ""
+    [string]$GCPProjectID = "",
+    [switch]$DevelopmentOnly
 )
+
+# This source deployment has no verified per-agent identity gateway. Cloud Run
+# TLS termination/IAM alone does not supply an AgentCard owner certificate CN.
+# Refuse BEFORE creating cloud resources instead of deploying a healthy-looking
+# service whose ownership writes all return 401.
+if (-not $DevelopmentOnly) {
+    Write-Error "This Cloud Run script is development-only: it cannot provide verified owner identities. Use an mTLS deployment or a separately configured trusted identity gateway for production. Pass -DevelopmentOnly only for an IAM-protected demo without owner isolation/signing."
+    exit 1
+}
 
 $ErrorActionPreference = "Continue"
 $PSNativeCommandUseErrorActionPreference = $false
@@ -122,7 +132,7 @@ if (-not $env:DB_PASSWORD) {
         $env:DB_PASSWORD = Read-Host "Set a password for the PostgreSQL database (or press Enter to auto-generate)"
         if (-not $env:DB_PASSWORD) {
             $env:DB_PASSWORD = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object {[char]$_})
-            Write-Host "  Auto-generated password: $env:DB_PASSWORD"
+            Write-Host '  Auto-generated password (stored in Secret Manager; not printed).'
         }
     }
 }
@@ -228,7 +238,6 @@ $envVars += ",DB_HOST=/cloudsql/$CLOUDSQL_CONN"
 $envVars += ",DB_PORT=5432"
 $envVars += ",DB_NAME=$DB_NAME"
 $envVars += ",DB_USERNAME=$DB_USER"
-$envVars += ",DB_PASSWORD=$env:DB_PASSWORD"
 $envVars += ",DB_POOL_MIN=2"
 $envVars += ",DB_POOL_MAX=10"
 $envVars += ",REGISTRY_ENABLE_HTTPS=false"
@@ -237,6 +246,10 @@ $envVars += ",REGISTRY_ENABLE_HTTPS=false"
 # owner.trusted.proxy.ips (ownership authentication stays on the verified identity).
 $envVars += ",REGISTRY_FORWARDED_ALLOW_IPS=*"
 $envVars += ",REGISTRY_OWNER_VALIDATION_MODE=relaxed"
+$envVars += ",REGISTRY_OWNER_ISOLATION_ENABLED=false"
+$envVars += ",REGISTRY_VERIFY_CLIENT=false"
+$envVars += ",REGISTRY_SIGNATURE_VALIDATION_ENABLED=false"
+$envVars += ",REGISTRY_REGISTRY_SIGN_ENABLED=false"
 
 Write-Host "  DB_HOST: /cloudsql/$CLOUDSQL_CONN"
 
@@ -244,7 +257,8 @@ $deployResult = gcloud run deploy "${SERVICE_NAME}" `
   --source=. `
   --region="$env:GCP_REGION" `
   --platform=managed `
-  --allow-unauthenticated `
+  --no-allow-unauthenticated `
+  --set-secrets="DB_PASSWORD=${SECRET_ID}:latest" `
   --memory="512Mi" `
   --cpu="1" `
   --max-instances="10" `
@@ -281,7 +295,7 @@ Write-Host ""
 Write-Host "  Service URL: ${SERVICE_URL}"
 Write-Host ""
 Write-Host "  Verify it works:"
-Write-Host "    curl ${SERVICE_URL}/rest/v1/registry-center/agent-cards"
+Write-Host '    Invoke using an authorized Cloud Run IAM identity token; anonymous access is disabled.'
 Write-Host ""
 Write-Host "  API endpoints:"
 Write-Host "    POST   ${SERVICE_URL}/rest/v1/registry-center/agent-cards"

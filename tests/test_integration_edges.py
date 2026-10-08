@@ -22,7 +22,7 @@ Complements the per-module unit suites with lifecycle and failure-mode
 edges that the happy-path tests do not reach:
 
 - listener.py: double-start guard, stop-before-start, thread-exit during
-  startup and the silent startup-timeout path (uvicorn.Server stubbed out
+  startup and startup-timeout cleanup (uvicorn.Server stubbed out
   so no socket is ever opened).
 - audit_sink.py: partial batch failure degrades to the local file with a
   rate-limited warning while the writer thread survives; stop() joins
@@ -37,6 +37,7 @@ All timing-sensitive paths use injected clocks or stubbed servers; the only
 real waits are bounded polling loops and one bounded in-flight-write stall.
 """
 
+import asyncio
 import threading
 import time
 
@@ -99,12 +100,13 @@ def _integration_conf():
 class _StubServer:
     """uvicorn.Server stand-in: never reaches the started state.
 
-    block=False -> run() returns immediately (thread exits during startup).
-    block=True  -> run() waits on should_exit (thread stays alive until
+    block=False -> serve() returns immediately (thread exits during startup).
+    block=True  -> serve() waits on should_exit (thread stays alive until
     stop()), which drives the startup-timeout path.
     """
 
     block = False
+    ready = False
     instance_count = 0
 
     def __init__(self, config):
@@ -113,16 +115,19 @@ class _StubServer:
         self.started = False
         self.should_exit = False
 
-    def run(self):
+    async def serve(self):
+        self.started = _StubServer.ready
         while _StubServer.block and not self.should_exit:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
 
 
 @pytest.fixture
 def stub_uvicorn_server(monkeypatch):
     _StubServer.block = False
+    _StubServer.ready = False
     _StubServer.instance_count = 0
     monkeypatch.setattr(listener_module.uvicorn, 'Server', _StubServer)
+    monkeypatch.setattr(listener_module.uvicorn.Config, 'load', lambda config: None)
     yield _StubServer
     _StubServer.block = False
 
@@ -150,6 +155,7 @@ class TestListenerLifecycle:
             preserve_integration_authn_handler, loguru_caplog):
         monkeypatch.setattr(listener_module, '_STARTUP_TIMEOUT_SECONDS', 0.3)
         _StubServer.block = True  # thread stays alive past the startup loop
+        _StubServer.ready = True
 
         server = ThirdPartyAccessServer(_integration_conf(), conf_obj=_FakeConfObj())
         server.start()
@@ -172,7 +178,7 @@ class TestListenerLifecycle:
         assert _StubServer.instance_count == 0, "stop() before start() must not build a server"
         assert "stopped" not in loguru_caplog.text, "no-op stop() must stay silent"
 
-    def test_thread_exit_during_startup_logs_error_and_returns(
+    def test_thread_exit_during_startup_raises_and_cleans(
             self, monkeypatch, stub_uvicorn_server,
             preserve_integration_authn_handler, loguru_caplog):
         # Short timeout is a safety net: the loop is expected to leave via the
@@ -181,14 +187,15 @@ class TestListenerLifecycle:
         _StubServer.block = False  # run() returns immediately -> thread dies
 
         server = ThirdPartyAccessServer(_integration_conf(), conf_obj=_FakeConfObj())
-        server.start()  # must return promptly, not spin for the full timeout
+        with pytest.raises(RuntimeError, match='startup failed'):
+            server.start()
 
         assert "thread exited during startup" in loguru_caplog.text
         assert "started on https://" not in loguru_caplog.text
-        assert server._thread is not None  # error path keeps the (dead) thread ref
+        assert server._thread is None
         server.stop()
 
-    def test_startup_timeout_returns_quietly_with_thread_alive(
+    def test_startup_timeout_raises_and_cleans_thread(
             self, monkeypatch, stub_uvicorn_server,
             preserve_integration_authn_handler, loguru_caplog):
         monkeypatch.setattr(listener_module, '_STARTUP_TIMEOUT_SECONDS', 0.3)
@@ -196,14 +203,15 @@ class TestListenerLifecycle:
 
         server = ThirdPartyAccessServer(_integration_conf(), conf_obj=_FakeConfObj())
         t0 = time.monotonic()
-        server.start()
+        with pytest.raises(RuntimeError, match='startup timed out'):
+            server.start()
         elapsed = time.monotonic() - t0
 
         assert elapsed >= 0.2, "start() must honor the startup window"
         assert elapsed < 5, "start() must return after the startup timeout"
         assert "started on https://" not in loguru_caplog.text
         assert "thread exited during startup" not in loguru_caplog.text
-        assert server._thread.is_alive(), "stub thread must still run after timeout"
+        assert server._thread is None, "timeout must stop the listener and release resources"
         server.stop()
 
 

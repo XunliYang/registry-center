@@ -294,13 +294,13 @@ class TestRegistrationOwnership:
 class TestAuthFailures:
     def test_missing_credentials_returns_401(self, client):
         c, stub, reg = client
-        stub.error = AuthFailureReason.MISSING_CREDENTIALS
+        stub.error = AuthenticationError(AuthFailureReason.MISSING_CREDENTIALS)
         resp = c.get("/integration/v1/agent-cards")
         assert resp.status_code == 401
 
     def test_bad_secret_returns_401(self, client):
         c, stub, reg = client
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert resp.status_code == 401
         body = resp.json()
@@ -322,7 +322,7 @@ class TestBanIntegration:
         c, stub, reg = client
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         for _ in range(3):
             resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
             assert resp.status_code == 401
@@ -341,14 +341,14 @@ class TestBanIntegration:
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
         stub.credentials = {"svc_app": object()}  # claimed appcode is known
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         stub.error = None
         stub.principal = _principal(CallerRole.NMS_OSS)
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 200
         # one more failure after a success must not ban (counter was cleared)
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert resp.status_code == 401
         assert "banned" not in resp.json()["errors"]["error"][0]["errorMessage"].lower()
@@ -362,7 +362,7 @@ class TestBanIntegration:
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
         tp_app._tp_prerate_item = parse_rate_limit("1000/second")
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         for i in range(3):  # every attempt uses a different appcode
             resp = c.get("/integration/v1/agent-cards",
                          headers={"X-App-Code": f"rotated_{i}", "X-App-Secret": "x"})
@@ -385,12 +385,12 @@ class TestBanIntegration:
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 200
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 429
 
-    def test_handler_returning_none_is_auth_failure_not_500(self, client):
-        """A misbehaving custom authn handler returning None must yield 401."""
+    def test_handler_returning_none_is_provider_failure_not_500(self, client):
+        """A provider contract defect must not be attributed to caller credentials."""
         c, stub, reg = client
         stub.principal = None
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
-        assert resp.status_code == 401
+        assert resp.status_code == 503
 
     def test_auth_failure_operation_attribution(self, client, monkeypatch):
         """Auth failures are audited with the ACTUAL operation, not always Register."""
@@ -403,7 +403,7 @@ class TestBanIntegration:
 
         monkeypatch.setattr(audit_module, "_audit_handle", _Rec())
         c, stub, reg = client
-        stub.error = AuthFailureReason.MISSING_CREDENTIALS
+        stub.error = AuthenticationError(AuthFailureReason.MISSING_CREDENTIALS)
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert entries[0]["operation_name"] == "Query Agent"
 

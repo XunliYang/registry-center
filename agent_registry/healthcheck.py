@@ -21,7 +21,9 @@ def probe() -> None:
     """Raise on an unsuccessful probe; never disable TLS certificate checks."""
     config = get_conf()
     host = os.environ.get('REGISTRY_HEALTHCHECK_HOST', '127.0.0.1')
-    port = int(config.get('port', 5000))
+    # docker exec/HEALTHCHECK inherits the image environment, not the exports
+    # performed by PID 1's entrypoint. Match its platform PORT precedence.
+    port = int(os.environ.get('PORT') or config.get('port', 5000))
     secure = str(config.get('enable_https', 'true')).lower() == 'true'
     handlers = [ProxyHandler({})]  # Local probe must not traverse an HTTP proxy.
     if secure:

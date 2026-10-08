@@ -17,6 +17,7 @@
 
 # ssl_config.py — SSL/TLS certificate configuration
 import asyncio
+import errno
 import os
 import platform
 import stat
@@ -50,11 +51,31 @@ def set_ssl_folder_permissions():
     if platform.system().lower() != "linux":
         logger.info(f"current system type is: {platform.system().lower()}")
         return
-    os.chmod(SSL_PATH, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    _restrict_ssl_permissions(SSL_PATH, 0o700)
     for root, _, files in os.walk(SSL_PATH):
         for file_name in files:
             file_path = os.path.join(root, file_name)
-            os.chmod(file_path, stat.S_IRUSR | stat.S_IWUSR)
+            _restrict_ssl_permissions(file_path, 0o600)
+
+
+def _restrict_ssl_permissions(path, desired_mode):
+    """Respect secure read-only secret mounts, reject unsafe ones.
+
+    Mounts can be owned by the deployment controller rather than the app UID.
+    Group read/traversal permits an explicitly provisioned secret-reader group;
+    world access and group/other writes are never accepted after chmod fails.
+    """
+    current = stat.S_IMODE(os.stat(path).st_mode)
+    if current == desired_mode:
+        return
+    try:
+        os.chmod(path, desired_mode)
+    except OSError as exc:
+        if exc.errno not in (errno.EROFS, errno.EPERM, errno.EACCES):
+            raise
+        if current & (stat.S_IRWXO | stat.S_IWGRP):
+            raise PermissionError(f'Unsafe permissions on TLS mount: {path}') from exc
+        logger.info(f'Using deployment-managed TLS permissions on {path}')
 
 
 # Singleton instance

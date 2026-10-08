@@ -1,5 +1,16 @@
 #!/bin/bash
 set -e
+umask 077
+
+# Reject unsupported serve flags before touching configuration. Additional
+# commands retain the standard container pass-through behavior.
+if [ "$#" -eq 0 ]; then
+    set -- serve
+fi
+if [ "$1" = "serve" ] && [ "$#" -ne 1 ]; then
+    echo "serve accepts no arguments; configure PORT/REGISTRY_* environment variables instead" >&2
+    exit 2
+fi
 
 APP_HOME="${APP_HOME:-/opt/registry-center}"
 cd "$APP_HOME"
@@ -7,10 +18,8 @@ cd "$APP_HOME"
 export PATH="/opt/venv/bin:$PATH"
 
 # ─────────────────────────────────────────────────────────────────────
-# Cloud Run environment variable → config file override
-# The application reads from config files, not env vars.
-# This bridge writes env var values into the config files so they
-# take effect at runtime.
+# Container conventions → configuration consumed by all application loaders.
+# REGISTRY_* is also read by Python, so normalize aliases before writing files.
 # ─────────────────────────────────────────────────────────────────────
 
 SERVER_CONF="etc/conf/server.conf"
@@ -30,6 +39,17 @@ if [ -n "${REGISTRY_IP}" ]; then
 fi
 
 # Cloud Run injects PORT env var
+if [ -n "${PORT}" ]; then
+    export REGISTRY_PORT="${PORT}"
+fi
+if [ -n "${REGISTRY_PORT}" ]; then
+    if ! [[ "${REGISTRY_PORT}" =~ ^[0-9]{1,5}$ ]] ||
+        [ "$((10#${REGISTRY_PORT}))" -lt 1 ] || [ "$((10#${REGISTRY_PORT}))" -gt 65535 ]; then
+        echo "PORT/REGISTRY_PORT must be an integer between 1 and 65535" >&2
+        exit 2
+    fi
+    export REGISTRY_PORT="$((10#${REGISTRY_PORT}))"
+fi
 if [ -n "${PORT}" ]; then
     sed -i "s#^PORT=.*#PORT=${PORT}#" "${SERVER_CONF}"
     echo "Config override: PORT=${PORT} (Cloud Run)"
@@ -56,8 +76,17 @@ fi
 # working when they override the image default.
 OWNER_VALIDATION_MODE_OVERRIDE="${REGISTRY_OWNER_VALIDATION_MODE:-${REGISTRY_OWNER__VALIDATION__MODE}}"
 if [ -n "${OWNER_VALIDATION_MODE_OVERRIDE}" ]; then
+    case "${OWNER_VALIDATION_MODE_OVERRIDE}" in
+        strict|relaxed) ;;
+        *) echo "owner validation mode must be strict or relaxed" >&2; exit 2 ;;
+    esac
+    export REGISTRY_OWNER_VALIDATION_MODE="${OWNER_VALIDATION_MODE_OVERRIDE}"
     sed -i "s#^owner.validation.mode=.*#owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}#" "${SERVER_CONF}"
     echo "Config override: owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}"
+fi
+if [ -n "${REGISTRY_OWNER__VALIDATION__MODE}" ]; then
+    echo "REGISTRY_OWNER__VALIDATION__MODE is deprecated; REGISTRY_OWNER_VALIDATION_MODE takes precedence when both are set" >&2
+    unset REGISTRY_OWNER__VALIDATION__MODE
 fi
 
 # TLS may terminate at a trusted reverse proxy. Disabling listener HTTPS must

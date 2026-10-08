@@ -12,7 +12,7 @@ from agent_registry import healthcheck
 @pytest.fixture
 def setup(monkeypatch):
     monkeypatch.setattr(healthcheck, 'get_conf', lambda: {'port': '5000', 'enable_https': 'false'})
-    for name in ('REGISTRY_HEALTHCHECK_HOST', 'REGISTRY_HEALTHCHECK_CLIENT_CERT', 'REGISTRY_HEALTHCHECK_CLIENT_KEY'):
+    for name in ('PORT', 'REGISTRY_HEALTHCHECK_HOST', 'REGISTRY_HEALTHCHECK_CLIENT_CERT', 'REGISTRY_HEALTHCHECK_CLIENT_KEY'):
         monkeypatch.delenv(name, raising=False)
     opener = MagicMock()
     response = opener.open.return_value.__enter__.return_value
@@ -27,6 +27,22 @@ def test_http_probe_matches_configuration(setup):
     opener.open.assert_called_once_with(
         'http://127.0.0.1:5000/rest/v1/registry-center/agent-cards', timeout=5)
     response.read.assert_not_called()
+
+
+def test_platform_port_overrides_config_for_separate_probe_process(setup, monkeypatch):
+    opener, _ = setup
+    monkeypatch.setenv('PORT', '9090')
+    healthcheck.probe()
+    opener.open.assert_called_once_with(
+        'http://127.0.0.1:9090/rest/v1/registry-center/agent-cards', timeout=5)
+
+
+def test_empty_platform_port_uses_configured_port(setup, monkeypatch):
+    opener, _ = setup
+    monkeypatch.setenv('PORT', '')
+    healthcheck.probe()
+    opener.open.assert_called_once_with(
+        'http://127.0.0.1:5000/rest/v1/registry-center/agent-cards', timeout=5)
 
 
 def test_https_uses_ca_and_client_credentials(setup, monkeypatch):
