@@ -65,6 +65,8 @@ Certificate format verification: X.509v2<br>
 Validity period verification: valid at the current time<br>
 National cipher (Guomi) certificates are not supported<br>
 
+> **Note**: Client-certificate revocation is enforced only while `ssl_crl_file` is an ACTIVE (uncommented) line in `etc/conf/server.conf` and the referenced file exists; the line ships commented out, so revocation checking is off by default. The init wizard asks for this path under the name `ssl_cert_certs`, which writes a key that no runtime code reads; set `ssl_crl_file` directly instead.<br>
+
 Minimize permissions for certificate files and their directories (e.g., file permissions 400/600, directory permissions 700), and ensure that the project process has read permission for the files<br>
 
 Configure certificates for the Registry Center using the init command. This command configures relevant certificate paths and interactively inputs the private key password
@@ -178,6 +180,8 @@ Audit logs are recorded for critical operations and system state changes. The au
 - Tag modification
 - Tag deletion
 
+READ operations on the main port (card list/search `query`, get one card and `retrieve` semantic search) are audited only when `audit.read_operations=true` is set in `etc/conf/server.properties`; the default is `false`, so main-port reads are not audited and high-frequency query traffic stays out of the audit log. The integration port always audits its reads, regardless of this key.<br>
+
 Six key elements of critical operations are recorded: time, client IP, user name, operation name, operation target, and operation result.<br>
 
 There are two recording methods:
@@ -224,6 +228,14 @@ Failure scenario:
 
 2. An audit log callback function is also provided for custom implementation.<br>
 For custom implementation, refer to the [Registry Center Development Guide "Custom Handler Usage" section](./Registry%20Center%20Development%20Guide.md#custom-handler-usage).
+
+### Archiving Audit Records to Customer MySQL
+
+In addition to the local audit file, `audit.mysql.*` in `etc/conf/persistence.conf` archives third-party audit records asynchronously into the operator's MySQL database (table `integration_audit_records`):<br>
+- Disabled by default (`audit.mysql.enabled=false`).<br>
+- The local audit file remains the authoritative record; a failed archive only logs a warning and degrades to local-only without blocking business requests.<br>
+- `REGISTRY_AUDIT_MYSQL_*` environment overrides apply while the keys stay as active lines in the file; a commented-out or missing key never receives an override.<br>
+- `audit.mysql.password` accepts an encrypted value (`enc:v1:` prefix) or plaintext; empty means no password.<br>
 
 ## AgentCard Content Security
 
@@ -335,6 +347,8 @@ Enter signing private key password:
 Private key password complexity is low (At least 8 characters), continue using this password? (y/n):  y
 ```
 
+Note: the `sign_certfile`, `sign_keyfile` and `sign_keyfile_password` prompts above write keys that no runtime code reads, so they are inert. The signing material actually used is `jwk_cert_path` (the signing certificate, whose public key is also served as the public JWK) together with `jwk_private_key_path` (the PEM private key file) and `jwk_private_key_password` (the path to a file whose content is the passphrase; empty means the key is unencrypted). The init wizard collects these under the `jwk_*` names; configure them in `etc/conf/server.conf` for the signature to be produced.<br>
+
 This signing feature is enabled by default and requires configuring the Registry Center signing certificate when enabled. Certificate requirements:<br>
 - server.cer:
 Required, identity certificate, only PEM encoding format supported<br>
@@ -349,7 +363,7 @@ Required, private key file, only PEM encoding format supported<br>
 Private key and public key matching: must match the public key in server.cer<br>
 The private key file must be protected by a private key password. The private key password must meet complexity requirements: at least 8 characters, containing at least two character types (digits, uppercase letters, lowercase letters, special characters `` `~!@#$%^&*()-_=+ | [{}]);:'",<.>/? `` and spaces)<br>
 
-The signature verification public key can be obtained via the GET /rest/v1/registry-center/keys interface. This interface has no request parameters and returns the public key content from the signing public key certificate sign_certfile configured in the init command in standard JWKS format. For the interface definition, refer to the [Registry Center API Reference](./Registry%20Center%20API%20Reference.md#get-public-key-information)<br>
+The signature verification public key can be obtained via the GET /rest/v1/registry-center/keys interface. This interface has no request parameters and returns the public key of the signing certificate configured in `jwk_cert_path` in standard JWKS format. For the interface definition, refer to the [Registry Center API Reference](./Registry%20Center%20API%20Reference.md#get-public-key-information)<br>
 
 For debugging scenarios, the [Self-Signed Certificate Generation Tool](#self-signed-certificate-generation-tool) can be used to generate the two certificate files that meet the above requirements. Note that such certificates must not be used in production environments.<br>
 

@@ -978,23 +978,56 @@ Restart the service after changes; model clients are cached. Use `python -m scri
 
 | Configuration Item | Description | Default Value           |
 |--------------------|-------------|-------------------------|
-| IP | Service listening IP | 127.0.0.1               |
-| PORT | Service listening port | 5000                    |
-| enable_https | Enable HTTPS | true                    |
-| ssl_certfile | Service certificate path | etc/ssl/server.cer      |
-| ssl_keyfile | Service private key path | etc/ssl/server_key.pem  |
-| ssl_keyfile_password | Private key passphrase file path | etc/ssl/cert_pwd        |
-| ssl_ca_certs | Trust certificate path | etc/ssl/trust.cer       |
-| verify_client | Verify client certificate | true                    |
-| signature_validation_enabled | Signature verification toggle | true                    |
-| agent_approval_enabled | Agent approval toggle | false                   |
-| owner.isolation.enabled | Owner isolation toggle | true                    |
-| use_vectordb | Enable vector database (replaces the authoritative store; see the warning above) | false                   |
-| startup.strict.storage | Refuse to start when use_vectordb=true leaves no authoritative record store | false                   |
-| jwk_cert_path | JWK signing certificate path | etc/ssl/server.cer |
-| jwk_private_key_path | JWK private key directory | etc/sign_cert |
-| jwk_private_key_password | JWK private key passphrase | '' |
-| registry.sign.enabled | Registry Center signing toggle | true |
+| IP | Service listening IP | 127.0.0.1 |
+| PORT | Service listening port | 5000 |
+| enable_https | Enable HTTPS on the main port | true |
+| ssl_certfile | Main-port identity certificate (`.cer`/PEM) | etc/ssl/server.cer |
+| ssl_keyfile | Main-port private key (`.pem`) | etc/ssl/server_key.pem |
+| ssl_keyfile_password | Path to the file whose content is the private key passphrase; the value is not the passphrase itself | etc/ssl/cert_pwd |
+| ssl_ca_certs | Trust certificate used to verify client certificates | etc/ssl/trust.cer |
+| ssl_crl_file | Client-certificate revocation list; the CRL check is enforced only while this line is active and the file exists | inactive (file: etc/ssl/revocationlist.crl) |
+| registry.sign.enabled | Sign AgentCards with the registry signing key | true |
+| verify_client | Require a client certificate; only the literal `false` disables verification | true |
+| forwarded_allow_ips | Comma-separated reverse-proxy addresses whose `X-Forwarded-*` headers are trusted; empty trusts no proxy | 127.0.0.1 |
+| jwk_cert_path | Signing certificate read from this local path, served as the public JWK and used to derive the `kid` | etc/ssl/server.cer |
+| jwk_private_key_path | PEM private key FILE that signs AgentCards; required together with `jwk_cert_path` while signing is enabled | etc/sign_cert |
+| jwk_private_key_password | Path to the file read verbatim as the private key passphrase; empty means the key is unencrypted | '' (empty) |
+| use_vectordb | Enable the vector database (replaces the authoritative store, so query endpoints return 503; see the warning above) | false |
+| startup.strict.storage | Refuse to start when `use_vectordb=true` leaves the registry without an authoritative record store; false logs the condition as a warning and continues | false |
+| signature_validation_enabled | Verify AgentCard signatures | true |
+| jwk_allowlist | Comma-separated hostnames allowed as `jku` for signer-supplied key lookup; empty disables the `jku` path (fail closed) | empty |
+| agent_approval_enabled | Enable the manual AgentCard approval workflow | false |
+| owner.isolation.enabled | Enable owner isolation on AgentCard writes | true |
+| owner.validation.mode | Owner validation: `strict` (CN format check plus verified identity) or `relaxed` (CN format check skipped) | relaxed |
+| owner.identity.mode | Caller identity source: `certificate` or `trusted_proxy` | certificate |
+| owner.trusted.proxy.ips | Comma-separated proxy IPs allowed to assert `X-SSL-Client-DN` when `owner.identity.mode=trusted_proxy`; empty ignores the header | empty |
+| startup.strict.identity | Abort startup when the identity configuration cannot verify callers | false |
+| integration.enabled | Enable the optional third-party HTTPS listener | false |
+| integration.ip | Bind address of the third-party listener | 127.0.0.1 |
+| integration.port | TCP port of the third-party listener (effective while `integration.enabled=true`) | 5001 |
+| integration.client_cert | Require an mTLS client certificate on the third-party port | false |
+| integration.auth.mode | Third-party authentication: `static_bearer`, `mtls`, `oauth2_introspection` or `oauth2_jwt` | oauth2_introspection |
+| integration.auth.fingerprint_key | HMAC secret that pseudonymizes bearer tokens in audit and rate-limit records; required for every mode except `mtls` | `${INTEGRATION_FINGERPRINT_KEY}` (unset) |
+| integration.auth.static.hmac_key | HMAC key that validates static bearer tokens; required in `static_bearer` mode | `${INTEGRATION_TOKEN_HMAC_KEY}` (unset) |
+| integration.credential.file | Credentials file holding static-bearer token digests and mTLS caller mappings | etc/conf/integration_credentials.conf |
+| integration.oauth2.introspection_uri | IAM RFC 7662 introspection endpoint (used by `oauth2_introspection`) | https://iam.example.com/oauth2/introspect |
+| integration.oauth2.client_id | The registry's own client id for introspection, not the caller's | `${OAUTH_INTROSPECTION_CLIENT_ID}` (unset) |
+| integration.oauth2.client_secret | The registry's own secret for introspection (HTTP Basic) | `${OAUTH_INTROSPECTION_CLIENT_SECRET}` (unset) |
+| integration.oauth2.issuer | Expected token issuer; a differing `iss` is rejected | https://iam.example.com |
+| integration.oauth2.audience | Expected token audience; a token whose `aud` lacks it is rejected | registry-center |
+| integration.oauth2.jwks_uri | JWKS URL used only by `oauth2_jwt` to verify the JWT signature locally | empty |
+| integration.oauth2.ca_file | CA bundle for the introspection/JWKS connection; empty uses the system roots | empty |
+| integration.token.enabled | Enable the token-acquisition proxy | false |
+| integration.token.provider | Token provider id; an unknown id aborts startup | oauth2_client_credentials |
+| integration.token.endpoint | HTTPS token endpoint the built-in provider posts to | https://iam.example.com/oauth2/token |
+| integration.token.ca_file | CA bundle used to verify the token endpoint; empty uses the system roots | empty |
+| heartbeat.enabled | Enable heartbeat detection | false |
+| heartbeat.hide.unhealthy.results | Hide suspect/offline agents from task-discovery results (health lists, history and SSE still show them) | false |
+| broadcast.enabled | Master switch for change broadcast; while false the subscription endpoints return 503 | false |
+| broadcast.allow.http.callbacks | Allow plain-HTTP callback URLs (development only) | false |
+| broadcast.callback.allowlist | Comma-separated permitted callback hosts; empty rejects all subscriptions | empty |
+| agent_to_graph_enabled | Reserved agent-to-graph switch; today it only prints one startup log line | false |
+| knowledge_graph.enabled | Enable the knowledge-graph API on the main port; while false every graph endpoint returns 404 | false |
 
 Note: the owner/identity rows above are the values shipped in the sample
 `etc/conf/server.conf`. The built-in code defaults are
@@ -1002,16 +1035,62 @@ Note: the owner/identity rows above are the values shipped in the sample
 `owner.identity.mode=certificate`; see the
 [Security Guide](Registry%20Center%20Security%20Guide.md).
 
+Note: values in `server.conf` and `persistence.conf` may use the `${VAR:default}`
+placeholder mechanism described in
+[Configuration example (MySQL)](#configuration-example-mysql). A dotted key must stay an
+ACTIVE (uncommented) line for its `REGISTRY_*` override to be applied, because the override
+reader only rewrites keys it already finds in the file; an underscored key such as `IP`,
+`PORT` or `enable_https` is added from the raw environment name either way.
+
 #### persistence.conf Configuration Items
 
 **Table 9** persistence.conf Configuration Item Description
 
 | Configuration Item | Description | Default Value |
 |--------------------|-------------|---------------|
-| persistence.mode | Storage mode | file |
-| postgresql.host | PostgreSQL host | 127.0.0.1 |
-| postgresql.port | PostgreSQL port | 5432 |
-| postgresql.name | Database name | registry_center |
+| persistence.mode | Storage backend: `file`, `sqlite`, `postgresql`, `gauss` or `mysql` | file |
+| postgresql.host | PostgreSQL host (mode `postgresql`) | 127.0.0.1 |
+| postgresql.port | PostgreSQL TCP port | 5432 |
+| postgresql.name | PostgreSQL database name; created at startup if missing (the role needs CREATE privilege) | registry_center |
+| postgresql.username | PostgreSQL login role | `${DB_USERNAME:opena2a_t}` |
+| postgresql.password | PostgreSQL password (`enc:v1:...` or plaintext); empty means no password | `${DB_PASSWORD}` (empty) |
+| postgresql.pool.min | Connections opened at startup and kept warm; keep <= `pool.max` | 5 |
+| postgresql.pool.max | Hard cap on open connections; a checkout beyond it fails at once | 20 |
+| postgresql.pool.timeout | UNUSED: no code reads this key; the psycopg2 pool has no wait timeout | 30 (no effect) |
+| postgresql.connect_timeout | Seconds to wait for one connection attempt (TCP plus authentication, not queries) | `${PG_CONNECT_TIMEOUT:10}` |
+| sqlite.path | SQLite database file (mode `sqlite`) | `${SQLITE_PATH:data/agents.db}` |
+| gauss.host | GaussDB host (mode `gauss`) | `${GAUSS_HOST:localhost}` |
+| gauss.port | GaussDB TCP port | `${GAUSS_PORT:5432}` |
+| gauss.database | GaussDB database name; created at startup if missing | `${GAUSS_DATABASE:a2a_registry}` |
+| gauss.username | GaussDB login role | `${GAUSS_USER:a2a_user}` |
+| gauss.password | GaussDB password (`enc:v1:...` or plaintext); empty means no password | `${GAUSS_PASSWORD}` (empty) |
+| gauss.pool.min | Connections opened at startup and kept warm; keep <= `pool.max` | `${GAUSS_POOL_MIN:5}` |
+| gauss.pool.max | Hard cap on open connections; a checkout beyond it fails at once | `${GAUSS_POOL_MAX:20}` |
+| gauss.connect_timeout | Seconds to wait for one connection attempt (TCP plus authentication) | `${GAUSS_CONNECT_TIMEOUT:10}` |
+| mysql.host | MySQL host (mode `mysql`, MySQL 5.7+/8.0) | `${MYSQL_HOST:localhost}` |
+| mysql.port | MySQL TCP port | `${MYSQL_PORT:3306}` |
+| mysql.name | MySQL database name; created at startup if missing | `${MYSQL_DATABASE:registry_center}` |
+| mysql.username | MySQL login role | `${MYSQL_USER:a2a_user}` |
+| mysql.password | MySQL password (`enc:v1:...` or plaintext); empty means no password | `${MYSQL_PASSWORD}` (empty) |
+| mysql.pool.min | Idle connections opened at startup and kept cached; keep <= `pool.max` | `${MYSQL_POOL_MIN:5}` |
+| mysql.pool.max | Hard cap on open connections; a caller beyond it waits with no timeout | `${MYSQL_POOL_MAX:20}` |
+| mysql.connect_timeout | Seconds to wait for the TCP connect only (not the handshake or queries) | `${MYSQL_CONNECT_TIMEOUT:10}` |
+| audit.mysql.enabled | Archive integration audit records to the operator's MySQL sink | `${AUDIT_MYSQL_ENABLED:false}` |
+| audit.mysql.host | Host of the customer MySQL server | `${AUDIT_MYSQL_HOST:localhost}` |
+| audit.mysql.port | TCP port of the customer MySQL server | `${AUDIT_MYSQL_PORT:3306}` |
+| audit.mysql.name | Database that receives the `integration_audit_records` table | `${AUDIT_MYSQL_DATABASE:registry_center}` |
+| audit.mysql.username | Dedicated minimal-privilege account on that database | `${AUDIT_MYSQL_USERNAME:a2a_user}` |
+| audit.mysql.password | Password (`enc:v1:...` or plaintext); empty means no password | `${AUDIT_MYSQL_PASSWORD}` (empty) |
+| audit.mysql.connect_timeout | Seconds to wait for the TCP connect only (an accepted-but-stalled server is not bounded) | `${AUDIT_MYSQL_CONNECT_TIMEOUT:10}` |
+| audit.mysql.batch_size | Rows per INSERT batch (bounded by the 10000-entry queue) | `${AUDIT_MYSQL_BATCH_SIZE:50}` |
+| audit.mysql.flush_interval | Idle poll interval and pause after a failed write, in seconds (decimals allowed) | `${AUDIT_MYSQL_FLUSH_INTERVAL:2}` |
+| neo4j.uri | Bolt URI of the Neo4j instance; `neo4j://` enables cluster routing | `${NEO4J_URI:bolt://localhost:7687}` |
+| neo4j.username | Neo4j login name | `${NEO4J_USERNAME:neo4j}` |
+| neo4j.password | Neo4j password, used as-is (no `cipher_util` decryption); empty makes every graph call return 503 | `${NEO4J_PASSWORD}` (empty) |
+
+Note: archiving is disabled by default, the local audit file remains the authoritative
+record, and a failed archive only logs a warning and degrades to local-only. The keys must
+stay as active lines in `persistence.conf` for `REGISTRY_AUDIT_MYSQL_*` overrides to apply.
 
 #### server.properties Configuration Items (Operating Parameters and Business Policies)
 
@@ -1021,27 +1100,63 @@ Note: the owner/identity rows above are the values shipped in the sample
 
 | Configuration Item | Description | Default Value |
 |--------------------|-------------|---------------|
-| tls.version | TLS protocol version | TLSv1.3,TLSv1.2 |
-| tls.cipher | TLS cipher suite list | See config file |
-| connection.max | Maximum connections | 500 |
-| connection.timeout | Connection timeout (seconds) | 300 |
-| agent.num.max | Agent registration limit | 100 |
-| tag.max.count | Agent tag count limit | 10 |
-| tag.max.length | Tag name length limit | 50 |
-| flowcontrol.ratelimit.register | Registration interface rate limit (req/sec) | 50 |
-| flowcontrol.ratelimit.query | Query interface rate limit (req/sec) | 100 |
-| flowcontrol.ratelimit.update | Update interface rate limit (req/sec) | 100 |
-| flowcontrol.ratelimit.get | Get single rate limit (req/sec) | 100 |
-| flowcontrol.ratelimit.retrieve | Semantic search rate limit (req/sec) | 100 |
-| flowcontrol.ratelimit.deregister | Deregistration interface rate limit (req/sec) | 50 |
-| flowcontrol.ratelimit.jwk | JWK interface rate limit (req/sec) | 10 |
-| flowcontrol.parallelism.register | Registration interface concurrency | 50 |
-| flowcontrol.parallelism.query | Query interface concurrency | 100 |
-| flowcontrol.parallelism.update | Update interface concurrency | 100 |
-| flowcontrol.parallelism.get | Get single concurrency | 100 |
-| flowcontrol.parallelism.retrieve | Semantic search concurrency | 100 |
-| flowcontrol.parallelism.deregister | Deregistration interface concurrency | 50 |
-| flowcontrol.parallelism.jwk | JWK interface concurrency | 1 |
+| tls.version | Protocol versions to offer; NOT READ by any code, so changing it has no effect: both listeners use Python's default for `PROTOCOL_TLS_SERVER` (measured as TLSv1.2 - TLSv1.3), and TLS 1.2 cannot be disabled through configuration | TLSv1.3,TLSv1.2 |
+| tls.cipher | Cipher suites in IANA names, comma-separated; converted to OpenSSL names and applied to both HTTPS listeners (unknown names are skipped with a warning; a missing value breaks main-listener startup) | See config file |
+| connection.timeout | Request deadline in seconds for the main API; a slower handler returns HTTP 504 (also passed to uvicorn as graceful-shutdown timeout) | 300 |
+| connection.max | Maximum concurrent HTTP responses on the main API (streaming bodies included); above it requests are rejected with HTTP 503 | 500 |
+| flowcontrol.ratelimit.register | Register (create cards) requests per second per client IP; excess returns HTTP 429 | 50 |
+| flowcontrol.parallelism.register | Concurrent in-flight register requests; excess returns HTTP 503 | 50 |
+| flowcontrol.ratelimit.query | Query (all list/read endpoints, health list/history/stream and `/changes`) requests per second per client IP | 100 |
+| flowcontrol.parallelism.query | Concurrent in-flight query requests | 100 |
+| flowcontrol.ratelimit.update | Update (full card replace) requests per second per client IP | 100 |
+| flowcontrol.parallelism.update | Concurrent in-flight update requests | 100 |
+| flowcontrol.ratelimit.get | Get one card by name and organization, requests per second per client IP | 100 |
+| flowcontrol.parallelism.get | Concurrent in-flight get requests | 100 |
+| flowcontrol.ratelimit.retrieve | Retrieve (semantic/fuzzy search) requests per second per client IP | 100 |
+| flowcontrol.parallelism.retrieve | Concurrent in-flight retrieve requests | 100 |
+| flowcontrol.ratelimit.deregister | Deregister (delete one card) requests per second per client IP | 50 |
+| flowcontrol.parallelism.deregister | Concurrent in-flight deregister requests | 50 |
+| flowcontrol.ratelimit.jwk | JWK (unauthenticated JWKS endpoint) requests per second per client IP | 10 |
+| flowcontrol.parallelism.jwk | Concurrent in-flight JWKS reads; 1 serializes them | 1 |
+| flowcontrol.ratelimit.heartbeat | Heartbeat reports per second per client IP | 100 |
+| flowcontrol.parallelism.heartbeat | Concurrent in-flight heartbeat requests | 100 |
+| flowcontrol.ratelimit.subscription | Subscription create/list/delete requests per second per client IP | 50 |
+| flowcontrol.parallelism.subscription | Concurrent in-flight subscription requests | 50 |
+| agent.num.max | Maximum number of registered agent cards; a create above it returns HTTP 409 (also used as the Milvus list-all page size) | 100 |
+| tag.max.count | Upper bound on tags per agent card; the set-tags operation rejects a larger merged tag set | 10 |
+| tag.max.length | Maximum characters per tag; allowed characters are Chinese, A-Z a-z, digits, dot, underscore and hyphen | 50 |
+| heartbeat.interval | Expected seconds between agent heartbeats (min 1); also returned to agents in the heartbeat reply | 30 |
+| heartbeat.failure.threshold | Multiplier on `heartbeat.interval` before a silent agent is flagged suspect (min 1) | 3 |
+| heartbeat.grace.period | Extra seconds added to every health window to absorb jitter (min 0) | 10 |
+| heartbeat.sweep.interval | Seconds between background health sweeps (min 1); lower values detect status changes sooner | 10 |
+| heartbeat.offline.ttl | Seconds an offline agent is kept before auto-deregistration (min 0; 0 = never auto-remove) | 0 |
+| broadcast.debounce.window | Seconds the dispatcher buffers events before flushing them, coalescing bursts into fewer calls | 2.0 |
+| broadcast.max.events.per.second | Per-subscription webhook send rate in events/second; excess events wait rather than drop | 50 |
+| broadcast.webhook.timeout | Seconds allowed for one webhook POST before the attempt fails | 10 |
+| broadcast.webhook.max.retries | Retries inside one delivery batch, so total in-process attempts = retries + 1 | 5 |
+| broadcast.webhook.backoff.base | Seconds for the first retry delay; the delay is base x 2^attempt with +/-30% jitter | 2 |
+| broadcast.webhook.backoff.max | Upper bound in seconds on the exponential retry delay | 300 |
+| broadcast.outbox.retention.days | Days an event is kept in the outbox; an hourly cleanup deletes older rows, bounding replay after an outage | 7 |
+| broadcast.delivery.max.attempts | Total delivery attempts per subscription and event across restarts (min 1); once spent, the delivery is abandoned | 5 |
+| broadcast.delivery.retry.interval | Seconds between sweeps that requeue failed deliveries; 0 disables the sweep task | 60 |
+| integration.ratelimit | Requests per second allowed for one authenticated credential on the integration port, written as `N/second` or a bare N; excess returns HTTP 429 | 100/second |
+| integration.preratelimit | Pre-authentication rate per source IP, applied before credentials are checked, to slow credential guessing | 50/second |
+| integration.ban.threshold | Consecutive authentication failures for one token fingerprint or source IP before that bucket is temporarily banned | 5 |
+| integration.ban.cooldown_seconds | Seconds a banned bucket stays blocked | 300 |
+| integration.oauth2.algorithms | Comma-separated JWT signing algorithms accepted for IAM-issued tokens; `none` is rejected and at least one entry is required | RS256 |
+| integration.oauth2.timeout_seconds | Timeout in seconds for IAM calls, both the JWKS fetch and token introspection (finite and > 0) | 3 |
+| integration.oauth2.cache_seconds | Introspection result cache duration in seconds; 0 = no caching, a positive value introduces a revocation visibility delay | 0 |
+| integration.oauth2.cache_max_entries | Capacity of the introspection result cache (must be > 0); the oldest entry is evicted first | 1024 |
+| integration.auth.scope_role.registry.read | Maps an OAuth2 or static-bearer scope to the `partner_service` caller role (read plus subscribe) | partner_service |
+| integration.auth.scope_role.registry.vendor | Maps the scope to the `vendor_agent` role (own cards only) | vendor_agent |
+| integration.auth.scope_role.registry.admin | Maps the scope to the `nms_oss` role (near-full access) | nms_oss |
+| integration.auth.scope_role.registry.audit | Maps the scope to the `analytics_tool` role (read-only plus audit pull) | analytics_tool |
+| integration.token.allowed_scopes | Space-separated scopes the registry may request from IAM for a caller; the default scope must be a subset or startup fails | registry.read registry.vendor |
+| integration.token.default_scope | Scope requested when the caller does not ask for one; must be a subset of `allowed_scopes` | registry.read |
+| integration.token.timeout_seconds | Overall cooperative deadline in seconds for built-in and custom token-acquisition providers (finite and > 0) | 3 |
+| knowledge_graph.ratelimit | Requests per second per client IP on the graph API, written as `N/second` or a bare N; excess returns HTTP 429 | 100/second |
+| knowledge_graph.allowed.owners | Comma-separated verified owner names allowed to read and write the graph without a `knowledge_graph:read` / `knowledge_graph:write` scope; empty requires the scope | empty |
+| audit.read_operations | Also audit main-port READ operations; false keeps high-frequency reads out of the audit log, while the integration port always audits its reads | false |
 
 ### Appendix 2: Error Code Description
 

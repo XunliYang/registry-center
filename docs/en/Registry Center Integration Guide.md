@@ -44,8 +44,8 @@ The server validates the signature, algorithm, issuer, audience and time claims.
 integration.auth.mode=oauth2_introspection
 integration.auth.fingerprint_key=${INTEGRATION_FINGERPRINT_KEY}
 integration.oauth2.introspection_uri=https://iam.example.com/oauth2/introspect
-integration.oauth2.client_id=${OAUTH_CLIENT_ID}
-integration.oauth2.client_secret=${OAUTH_CLIENT_SECRET}
+integration.oauth2.client_id=${OAUTH_INTROSPECTION_CLIENT_ID}
+integration.oauth2.client_secret=${OAUTH_INTROSPECTION_CLIENT_SECRET}
 integration.oauth2.issuer=https://iam.example.com
 integration.oauth2.audience=registry-center
 integration.oauth2.ca_file=
