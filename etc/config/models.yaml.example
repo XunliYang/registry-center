@@ -8,6 +8,47 @@
 # names the environment variable (or repository-root .env key) that holds the
 # secret. Optional per capability: description, timeout (seconds, default 60),
 # verify_ssl (default true), enable_thinking (chat only, default false).
+#
+# Field reference (validated by common/llm/config/model_sources.py; the whole
+# file is rejected on the first violation instead of starting with a partial
+# configuration):
+#   The file must contain exactly one top-level `models:` mapping and nothing
+#   else. Capability names match ^[a-z][a-z0-9_]*$; chat/embed/rerank are the
+#   built-in ones. A capability that is never requested may be left commented
+#   out - a missing capability raises "No model configured for capability ..."
+#   at the first call, not at startup.
+#   provider     optional, default openai_compatible. Must have a registered
+#                profile for that capability, otherwise "No model profile for
+#                <provider>/<capability>" is raised.
+#   model        required, non-empty string sent to the provider.
+#   url          required, http:// or https:// with a host and no embedded
+#                user:password credentials.
+#   api_key_env  optional; names the variable holding the API key. Omit it for a
+#                keyless local endpoint. A literal secret here is rejected.
+#   description  optional, defaults to the capability name; used in logs.
+#   timeout      optional, positive number of seconds, default 60; 0 or a
+#                negative/boolean value is rejected.
+#   verify_ssl   optional boolean, default true. false disables TLS certificate
+#                verification for this endpoint - use only for a trusted local
+#                endpoint.
+#   enable_thinking  optional boolean, chat only, default false; asks an
+#                OpenAI-compatible endpoint for reasoning content.
+#   auth         optional mapping for providers that sign requests. Each field
+#                is either "<name>_env" (naming the environment variable that
+#                holds the value) or one of the literal public fields api_code,
+#                api_version, scenario_code, scenario_version, ability_code,
+#                test_flag. Defining both `app_key` and `app_key_env` is
+#                rejected, as is an auth field the selected provider never reads.
+#                The aoc_signed profile requires auth.app_key_env and
+#                auth.app_secret_env; an OpenAI-compatible endpoint takes no
+#                auth block at all.
+# Selecting another file: set LLM_CONFIG_FILE (absolute, or relative to the
+# repository root); otherwise etc/config/models.yaml is used, falling back to
+# the legacy common/config/models.yaml when the former does not exist. Docker
+# Compose mounts one through LLM_CONFIG_HOST_FILE.
+# Containers: the image ships no models.yaml. bin/entrypoint.sh generates a
+# chat-only openai_compatible entry when LLM_CHAT_MODEL and LLM_CHAT_URL are set
+# and models.yaml is absent; embed/rerank always need this file.
 models:
   chat:
     provider: openai_compatible

@@ -34,29 +34,43 @@ ssl_certfile=etc/ssl/server.cer
 # Private key file, only pem format supported
 ssl_keyfile=etc/ssl/server_key.pem
 
-# Private key file password
+# Path to a file whose content is the private key passphrase, as written by the init
+# wizard; the value is NOT the passphrase itself.
 ssl_keyfile_password=etc/ssl/cert_pwd
 
 # Trust certificate, only cer format supported
 ssl_ca_certs=etc/ssl/trust.cer
 
-# Revocation list
+# Revocation list: client-certificate revocation is enforced only while this line is
+# active and the file exists (it enables the CRL leaf check). Commented out = no
+# revocation checking. Set ssl_crl_file directly: the init wizard asks for this path
+# under the name ssl_cert_certs, which no runtime code reads.
 #ssl_crl_file=etc/ssl/revocationlist.crl
 
 # Registry signature configuration required
 registry.sign.enabled=true
 
-# Verify client certificate
+# Verify client certificate. Only the literal value false disables verification; every
+# other value (including a typo) keeps clients verified, so the default fails closed.
 verify_client=true
 
+# Comma-separated reverse-proxy addresses whose X-Forwarded-* headers are trusted;
+# empty means "trust no proxy" (fail closed). A bare value is recommended; surrounding
+# quotes are tolerated and stripped. Never use '*' on an internet-facing port.
 forwarded_allow_ips=127.0.0.1
 
-# Downloading JWK certificate path
+# Certificate of the registry's own signing key, read from this local path to serve the
+# public JWK at GET /rest/v1/registry-center/keys and to derive the kid. Nothing is
+# downloaded from this value.
 jwk_cert_path=etc/ssl/server.cer
 
-# Private certificate file path
+# PEM private key FILE (not a directory) that signs AgentCards; required together with
+# jwk_cert_path while registry.sign.enabled=true. When the file is missing the signer is
+# skipped and only an error is logged, so cards would be issued unsigned.
 jwk_private_key_path=etc/sign_cert
 
+# Path to the file read verbatim as the JWK private key passphrase; empty means the
+# key is unencrypted. Restrict it to the service account: it unlocks signing.
 jwk_private_key_password=''
 
 # Enable vector database
@@ -79,45 +93,102 @@ agent_approval_enabled=false
 # Enable owner management logic
 owner.isolation.enabled=true
 
-# Owner validation mode
-# strict: strict validation, CN must be valid format
-# relaxed: relaxed mode, CN can be empty
+# Owner validation mode. In BOTH modes a client certificate with an empty CN yields no
+# owner; the modes differ in what is enforced:
+# strict: the CN must match the required format AND registration needs a verified identity
+# relaxed: the CN format check is skipped and unverified identities are accepted
 owner.validation.mode=relaxed
 
 # Certificate identity requires HTTPS with client verification.
 owner.identity.mode=certificate
+# Comma-separated IPs of reverse proxies allowed to assert X-SSL-Client-DN when
+# owner.identity.mode=trusted_proxy; empty ignores all headers (fail closed). No '*'.
 owner.trusted.proxy.ips=
 # Containers enable this via REGISTRY_STARTUP_STRICT_IDENTITY=true.
 startup.strict.identity=false
+# Refuse to start when use_vectordb=true leaves the registry without an authoritative
+# record store (the vector store is a derived index, not a source of truth). Default
+# false: the condition is logged as a warning and startup continues.
+startup.strict.storage=false
 
 # Optional third-party HTTPS listener; independent from main-port identity.
 integration.enabled=false
+# Bind address of the third-party access port, default 127.0.0.1 (the main IP);
+# bind a routable address only behind a firewall or an authenticating proxy.
 integration.ip=127.0.0.1
+# TCP port of the third-party access port, default 5001. Effective only while
+# integration.enabled=true; it reuses the main TLS certificate and key files.
 integration.port=5001
+# Require a client certificate (mTLS) on the third-party port, default false. When true
+# the TLS handshake demands a cert and, if integration.auth.mode is not set at all, the
+# auth mode defaults to mtls (an explicitly set mode below still wins).
 integration.client_cert=false
-# Recommended when revocation/validity must be checked with IAM on every request.
+# Authentication mode of the third-party port: static_bearer (HMAC-digested tokens from
+# the credentials file), mtls (caller certificate only), oauth2_introspection (token
+# checked against the IAM per request) or oauth2_jwt (JWT verified against jwks_uri).
 integration.auth.mode=oauth2_introspection
+# Secret HMAC key used to fingerprint (pseudonymize) bearer tokens in audit and
+# rate-limit records, never the token itself. Required for every mode except mtls.
 integration.auth.fingerprint_key=${INTEGRATION_FINGERPRINT_KEY}
+# HMAC key that validates static bearer tokens; required (non-empty) when
+# integration.auth.mode=static_bearer. Inject it, never commit it.
+integration.auth.static.hmac_key=${INTEGRATION_TOKEN_HMAC_KEY}
+# Credentials file holding static-bearer token digests and mTLS caller mappings; the
+# shipped template is etc/conf/integration_credentials.conf. Required in static_bearer
+# and mtls modes.
+integration.credential.file=etc/conf/integration_credentials.conf
+# HTTPS RFC 7662 introspection endpoint on the IAM; required when the auth mode
+# above is oauth2_introspection. Called per token unless oauth2 cache_seconds > 0.
 integration.oauth2.introspection_uri=https://iam.example.com/oauth2/introspect
 # Registry's own validation credentials: NOT the calling client's credentials.
 integration.oauth2.client_id=${OAUTH_INTROSPECTION_CLIENT_ID}
+# Secret the registry presents to the introspection endpoint (HTTP Basic, paired
+# with client_id above), not the caller's token; inject it, never commit it.
 integration.oauth2.client_secret=${OAUTH_INTROSPECTION_CLIENT_SECRET}
+# Expected token issuer: tokens whose iss differs (introspection or JWT) are rejected.
 integration.oauth2.issuer=https://iam.example.com
+# Expected token audience: tokens whose aud lacks this value are rejected, which
+# prevents replay of tokens minted for another service.
 integration.oauth2.audience=registry-center
+# JWKS URL used only when integration.auth.mode=oauth2_jwt: the JWT signature is
+# verified locally against the keys published there (HTTPS; private CA via ca_file).
+integration.oauth2.jwks_uri=
 # Empty CA file uses system roots; private CA must be mounted explicitly.
 integration.oauth2.ca_file=
 
 # Optional acquisition proxy. IAM authenticates each caller's own HTTP Basic credentials.
 integration.token.enabled=false
+# Token acquisition provider id, default oauth2_client_credentials (RFC 6749
+# client_credentials against integration.token.endpoint); unknown ids abort startup.
 integration.token.provider=oauth2_client_credentials
+# HTTPS token endpoint the built-in provider posts to; set integration.token.ca_file
+# below when the IAM uses a private CA. Never embed credentials in this URL.
 integration.token.endpoint=https://iam.example.com/oauth2/token
-# Fixed, non-sensitive endpoint query parameters are allowed; never put credentials in URLs.
+# CA bundle used to verify the token endpoint's TLS certificate; empty uses the system
+# roots, so a private CA must be mounted explicitly.
 integration.token.ca_file=
 
 # Optional heartbeat and change-notification features; timing/retry policies in server.properties.
 heartbeat.enabled=false
+# true hides suspect/offline Agents from task-discovery results once heartbeat
+# detection is enabled; health lists, history, SSE and offline alerts still show them.
 heartbeat.hide.unhealthy.results=false
+# Master switch for registry change broadcast; while false the subscription
+# endpoints return 503 and no webhook is ever delivered.
 broadcast.enabled=false
+# Allow plain-HTTP callback URLs (development only, default false). HTTPS keeps
+# event payloads confidential; broadcast.callback.allowlist is still enforced.
 broadcast.allow.http.callbacks=false
 # Comma-separated permitted callback hosts; empty rejects all subscriptions.
 broadcast.callback.allowlist=
+
+# Reserved agent-to-graph switch. Its only effect today is one startup log line:
+# no agent data is exported yet. Graph data is served by the knowledge-graph API
+# below, which is gated by its own switch.
+agent_to_graph_enabled=false
+
+# Enable the knowledge-graph API on the main port. While false every graph endpoint
+# answers HTTP 404 (fail closed). Its rate limit and owner allowlist live in
+# server.properties (knowledge_graph.ratelimit, knowledge_graph.allowed.owners), and the
+# Neo4j connection is configured in persistence.conf (neo4j.uri/username/password).
+knowledge_graph.enabled=false

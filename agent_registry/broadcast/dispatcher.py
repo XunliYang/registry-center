@@ -309,7 +309,9 @@ class WebhookDispatcher:
                 except Exception as exc:
                     logger.warning('Pending delivery recovery failed: {}', type(exc).__name__)
                 self._cleanup_counter += 1
-                if self._cleanup_counter >= 3600:  # roughly once per hour
+                # Count flusher iterations, not seconds: at the default
+                # 2-second debounce window this is roughly every two hours.
+                if self._cleanup_counter >= 3600:
                     self._cleanup_counter = 0
                     try:
                         removed = self._outbox.cleanup(
