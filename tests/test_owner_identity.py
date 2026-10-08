@@ -377,6 +377,21 @@ def main_port_pki(tmp_path_factory):
                    .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
                    .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30))
                    .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                   .add_extension(x509.KeyUsage(
+                       digital_signature=True,
+                       content_commitment=False,
+                       key_encipherment=True,
+                       data_encipherment=False,
+                       key_agreement=False,
+                       key_cert_sign=False,
+                       crl_sign=False,
+                       encipher_only=False,
+                       decipher_only=False,
+                   ), critical=True)
+                   .add_extension(x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()),
+                                  critical=False)
+                   .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                                  critical=False)
                    .add_extension(x509.SubjectAlternativeName([
                        x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1"))]), critical=False)
                    .sign(ca_key, hashes.SHA256()))

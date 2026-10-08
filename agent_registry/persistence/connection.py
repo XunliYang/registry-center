@@ -74,12 +74,15 @@ def ensure_pg_tables(conn_pool: pool.ThreadedConnectionPool, queries,
                 queries.ADD_COLUMN_STATUS.value,
                 queries.ADD_COLUMN_TAGS.value,
                 queries.ADD_COLUMN_OWNER.value,
+                queries.ADD_COLUMN_LAYER.value,
+                queries.NORMALIZE_LAYER.value,
                 queries.DROP_OLD_UNIQUE_INDEX.value,
                 queries.CREATE_OWNER_UNIQUE_INDEX.value,
                 queries.CREATE_INDEX_ORG.value,
                 queries.CREATE_INDEX_NAME.value,
                 queries.CREATE_INDEX_STATUS.value,
                 queries.CREATE_INDEX_OWNER.value,
+                queries.CREATE_INDEX_LAYER.value,
                 *extra_statements,
             ):
                 cur.execute(statement)
@@ -89,4 +92,8 @@ def ensure_pg_tables(conn_pool: pool.ThreadedConnectionPool, queries,
             cur.execute(queries.CREATE_TAG_INDEX_NAME.value)
             logger.info("Table 'tag' and indexes created/verified")
     finally:
+        # The connection is returned to a pool and may later participate in a
+        # multi-statement unit of work.  Do not leak the bootstrap connection's
+        # autocommit setting into normal registry transactions.
+        conn.autocommit = False
         conn_pool.putconn(conn)

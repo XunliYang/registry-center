@@ -20,6 +20,7 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
 from a2a.types import AgentCard
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, LAYER_UNSET
 from agent_registry.model.tag import Tag
 
 
@@ -31,6 +32,7 @@ class AgentRecord:
     created_at: str = ''
     updated_at: str = ''
     tags: List[str] = field(default_factory=list)
+    layer: str = UNKNOWN_LAYER
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -39,7 +41,8 @@ class AgentRecord:
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "tags": self.tags
+            "tags": self.tags,
+            "layer": self.layer,
         }
 
 
@@ -55,7 +58,8 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
-    def create(self, agent: AgentCard, owner: Optional[str] = None, status: str = 'published') -> bool:
+    def create(self, agent: AgentCard, owner: Optional[str] = None,
+               status: str = 'published', layer: str = UNKNOWN_LAYER) -> bool:
         pass
 
     @abstractmethod
@@ -90,7 +94,8 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
-    def update(self, name: str, organization: str, agent_data: Dict[str, Any], owner: Optional[str] = None) -> bool:
+    def update(self, name: str, organization: str, agent_data: Dict[str, Any],
+               owner: Optional[str] = None, layer=LAYER_UNSET) -> bool:
         pass
 
     @abstractmethod
@@ -170,3 +175,36 @@ class StorageBackend(ABC):
         startup pre-check uses to fail fast before the server binds a port.
         """
         return None
+
+    def find_records(self, name: Optional[str] = None,
+                     organization: Optional[str] = None,
+                     layer: Optional[str] = None,
+                     status: Optional[str] = None) -> List[AgentRecord]:
+        """Return registration records for layer-aware queries.
+
+        The default implementation keeps custom storage backends compatible.
+        Built-in backends override it to push the layer predicate into their
+        storage engine.
+        """
+
+        if name is not None and organization is not None:
+            records = []
+            record = self.find_by_key(name, organization)
+            if record:
+                records.append(record)
+        elif name is not None:
+            records = [self.find_by_key(agent.name, agent.provider.organization)
+                       for agent in self.find_by_name(name)]
+            records = [record for record in records if record]
+        elif organization is not None:
+            records = [self.find_by_key(agent.name, agent.provider.organization)
+                       for agent in self.find_by_organization(organization)]
+            records = [record for record in records if record]
+        else:
+            records = [self.find_by_key(agent.name, agent.provider.organization)
+                       for agent in self.find_all()]
+            records = [record for record in records if record]
+
+        return [record for record in records
+                if (layer is None or record.layer == layer)
+                and (status is None or record.status == status)]

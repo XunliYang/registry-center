@@ -29,6 +29,7 @@ class PostgreSQLQueries(str, Enum):
             url             VARCHAR(1024),
             version         VARCHAR(50),
             status          VARCHAR(20) DEFAULT 'published',
+            layer           VARCHAR(64) NOT NULL DEFAULT 'unknown',
             provider_json   JSONB        NOT NULL,
             capabilities_json JSONB,
             skills_json     JSONB,
@@ -44,6 +45,7 @@ class PostgreSQLQueries(str, Enum):
     CREATE_INDEX_ORG = "CREATE INDEX IF NOT EXISTS idx_agent_org ON agent_card(organization)"
     CREATE_INDEX_NAME = "CREATE INDEX IF NOT EXISTS idx_agent_name ON agent_card(name)"
     CREATE_INDEX_STATUS = "CREATE INDEX IF NOT EXISTS idx_agent_status ON agent_card(status)"
+    CREATE_INDEX_LAYER = "CREATE INDEX IF NOT EXISTS idx_agent_layer ON agent_card(layer)"
     CREATE_INDEX_GIN = "CREATE INDEX IF NOT EXISTS idx_agent_card_json ON agent_card USING GIN(agent_card_json)"
 
     ADD_COLUMN_STATUS = """
@@ -118,6 +120,21 @@ class PostgreSQLQueries(str, Enum):
         END $$;
     """
 
+    ADD_COLUMN_LAYER = """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='agent_card' AND column_name='layer') THEN
+                ALTER TABLE agent_card ADD COLUMN layer VARCHAR(64) NOT NULL DEFAULT 'unknown';
+            END IF;
+        END $$;
+    """
+
+    NORMALIZE_LAYER = """
+        UPDATE agent_card SET layer = 'unknown'
+        WHERE layer IS NULL OR TRIM(layer) = ''
+    """
+
     CREATE_INDEX_OWNER = "CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_card(owner)"
 
     DROP_OLD_UNIQUE_INDEX = """
@@ -134,31 +151,41 @@ class PostgreSQLQueries(str, Enum):
     """
 
     CREATE_AGENT_WITH_OWNER = """
-        INSERT INTO agent_card (name, organization, owner, description, url, version, status, provider_json,
+        INSERT INTO agent_card (name, organization, owner, description, url, version, status, layer, provider_json,
                                 capabilities_json, skills_json, default_input_modes, default_output_modes,
                                 agent_card_json, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (name, organization, owner) DO NOTHING
     """
 
     FIND_BY_KEY_WITH_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s AND owner = %s
     """
 
     FIND_BY_KEY_ANY_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s
         ORDER BY owner NULLS LAST
         LIMIT 1
     """
 
     FIND_BY_OWNER = """
-        SELECT agent_card_json, owner FROM agent_card WHERE owner = %s
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card WHERE owner = %s
     """
 
     UPDATE_AGENT_WITH_OWNER = """
         UPDATE agent_card SET agent_card_json = %s, status = %s, updated_at = %s
+        WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
+    """
+
+    UPDATE_AGENT_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
+        WHERE name = %s AND organization = %s
+    """
+
+    UPDATE_AGENT_WITH_OWNER_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
         WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
     """
 
@@ -242,6 +269,7 @@ class SQLiteQueries(str, Enum):
             url                  TEXT,
             version              TEXT,
             status               TEXT DEFAULT 'published',
+            layer                TEXT NOT NULL DEFAULT 'unknown',
             provider_json        TEXT NOT NULL,
             capabilities_json    TEXT,
             skills_json          TEXT,
@@ -257,22 +285,28 @@ class SQLiteQueries(str, Enum):
     CREATE_INDEX_ORG = "CREATE INDEX IF NOT EXISTS idx_agent_org ON agent_card(organization)"
     CREATE_INDEX_NAME = "CREATE INDEX IF NOT EXISTS idx_agent_name ON agent_card(name)"
     CREATE_INDEX_STATUS = "CREATE INDEX IF NOT EXISTS idx_agent_status ON agent_card(status)"
+    CREATE_INDEX_LAYER = "CREATE INDEX IF NOT EXISTS idx_agent_layer ON agent_card(layer)"
+
+    NORMALIZE_LAYER = """
+        UPDATE agent_card SET layer = 'unknown'
+        WHERE layer IS NULL OR TRIM(layer) = ''
+    """
     CREATE_INDEX_OWNER = "CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_card(owner)"
 
     CREATE_AGENT_WITH_OWNER = """
-        INSERT INTO agent_card (name, organization, owner, description, url, version, status, provider_json,
+        INSERT INTO agent_card (name, organization, owner, description, url, version, status, layer, provider_json,
                                 capabilities_json, skills_json, default_input_modes, default_output_modes,
                                 agent_card_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     FIND_BY_KEY_WITH_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = ? AND organization = ? AND owner = ?
     """
 
     FIND_BY_KEY_ANY_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = ? AND organization = ?
         ORDER BY owner IS NULL, owner
         LIMIT 1
@@ -298,7 +332,7 @@ class SQLiteQueries(str, Enum):
     FIND_ALL = "SELECT agent_card_json FROM agent_card"
 
     FIND_BY_OWNER = """
-        SELECT agent_card_json, owner FROM agent_card WHERE owner = ?
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card WHERE owner = ?
     """
 
     UPDATE_AGENT = """
@@ -308,6 +342,16 @@ class SQLiteQueries(str, Enum):
 
     UPDATE_AGENT_WITH_OWNER = """
         UPDATE agent_card SET agent_card_json = ?, status = ?, updated_at = ?
+        WHERE name = ? AND organization = ? AND (owner = ? OR owner IS NULL)
+    """
+
+    UPDATE_AGENT_LAYER = """
+        UPDATE agent_card SET agent_card_json = ?, status = ?, layer = ?, updated_at = ?
+        WHERE name = ? AND organization = ?
+    """
+
+    UPDATE_AGENT_WITH_OWNER_LAYER = """
+        UPDATE agent_card SET agent_card_json = ?, status = ?, layer = ?, updated_at = ?
         WHERE name = ? AND organization = ? AND (owner = ? OR owner IS NULL)
     """
 
@@ -406,6 +450,7 @@ class GaussDBQueries(str, Enum):
             url                  VARCHAR(1024),
             version              VARCHAR(50),
             status               VARCHAR(20) DEFAULT 'published',
+            layer                VARCHAR(64) NOT NULL DEFAULT 'unknown',
             provider_json        TEXT        NOT NULL,
             capabilities_json    TEXT,
             skills_json          TEXT,
@@ -421,6 +466,7 @@ class GaussDBQueries(str, Enum):
     CREATE_INDEX_ORG = "CREATE INDEX IF NOT EXISTS idx_agent_org ON agent_card(organization)"
     CREATE_INDEX_NAME = "CREATE INDEX IF NOT EXISTS idx_agent_name ON agent_card(name)"
     CREATE_INDEX_STATUS = "CREATE INDEX IF NOT EXISTS idx_agent_status ON agent_card(status)"
+    CREATE_INDEX_LAYER = "CREATE INDEX IF NOT EXISTS idx_agent_layer ON agent_card(layer)"
     CREATE_INDEX_OWNER = "CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_card(owner)"
 
     ADD_COLUMN_STATUS = """
@@ -453,6 +499,21 @@ class GaussDBQueries(str, Enum):
         END $$;
     """
 
+    ADD_COLUMN_LAYER = """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='agent_card' AND column_name='layer') THEN
+                ALTER TABLE agent_card ADD COLUMN layer VARCHAR(64) NOT NULL DEFAULT 'unknown';
+            END IF;
+        END $$;
+    """
+
+    NORMALIZE_LAYER = """
+        UPDATE agent_card SET layer = 'unknown'
+        WHERE layer IS NULL OR TRIM(layer) = ''
+    """
+
     DROP_OLD_UNIQUE_INDEX = """
         DO $$
         BEGIN
@@ -467,20 +528,20 @@ class GaussDBQueries(str, Enum):
     """
 
     CREATE_AGENT_WITH_OWNER = """
-        INSERT INTO agent_card (name, organization, owner, description, url, version, status, provider_json,
+        INSERT INTO agent_card (name, organization, owner, description, url, version, status, layer, provider_json,
                                 capabilities_json, skills_json, default_input_modes, default_output_modes,
                                 agent_card_json, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (name, organization, owner) DO NOTHING
     """
 
     FIND_BY_KEY_WITH_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s AND owner = %s
     """
 
     FIND_BY_KEY_ANY_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s
         ORDER BY owner NULLS LAST
         LIMIT 1
@@ -506,7 +567,7 @@ class GaussDBQueries(str, Enum):
     FIND_ALL = "SELECT agent_card_json FROM agent_card"
 
     FIND_BY_OWNER = """
-        SELECT agent_card_json, owner FROM agent_card WHERE owner = %s
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card WHERE owner = %s
     """
 
     UPDATE_AGENT = """
@@ -516,6 +577,16 @@ class GaussDBQueries(str, Enum):
 
     UPDATE_AGENT_WITH_OWNER = """
         UPDATE agent_card SET agent_card_json = %s, status = %s, updated_at = %s
+        WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
+    """
+
+    UPDATE_AGENT_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
+        WHERE name = %s AND organization = %s
+    """
+
+    UPDATE_AGENT_WITH_OWNER_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
         WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
     """
 
@@ -606,9 +677,9 @@ class MySQLQueries(str, Enum):
       returns False, mirroring ON CONFLICT DO NOTHING.
     - Tag containment uses JSON_CONTAINS(tags, '["<tag>"]') on the native
       JSON column (PG uses @>).
-    - MySQL has no ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS, so
-      indexes are inlined in CREATE TABLE and no migration DDL is defined
-      (MySQL support is fresh-install only).
+    - MySQL has no ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS. The
+      storage initializer checks and adds the layer column/index explicitly;
+      indexes are also inlined in CREATE TABLE.
     - Key columns (name/organization/owner/tag.name) use COLLATE utf8mb4_bin
       so exact matches and UNIQUE constraints stay case-sensitive like PG;
       FIND_BY_NAME compensates with LOWER() on both sides.
@@ -631,6 +702,7 @@ class MySQLQueries(str, Enum):
             url                  VARCHAR(1024),
             version              VARCHAR(50),
             status               VARCHAR(20)  DEFAULT 'published',
+            layer                VARCHAR(64)  NOT NULL DEFAULT 'unknown',
             provider_json        JSON         NOT NULL,
             capabilities_json    JSON         NULL,
             skills_json          JSON         NULL,
@@ -645,25 +717,26 @@ class MySQLQueries(str, Enum):
             KEY idx_agent_org (organization),
             KEY idx_agent_name (name),
             KEY idx_agent_status (status),
+            KEY idx_agent_layer (layer),
             KEY idx_agent_owner (owner)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     """
 
     CREATE_AGENT_WITH_OWNER = """
-        INSERT INTO agent_card (name, organization, owner, description, url, version, status, provider_json,
+        INSERT INTO agent_card (name, organization, owner, description, url, version, status, layer, provider_json,
                                 capabilities_json, skills_json, default_input_modes, default_output_modes,
                                 agent_card_json, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE id = id
     """
 
     FIND_BY_KEY_WITH_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s AND owner = %s
     """
 
     FIND_BY_KEY_ANY_OWNER = """
-        SELECT agent_card_json, owner, status, tags, created_at, updated_at FROM agent_card
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card
         WHERE name = %s AND organization = %s
         ORDER BY owner IS NULL, owner
         LIMIT 1
@@ -689,7 +762,7 @@ class MySQLQueries(str, Enum):
     FIND_ALL = "SELECT agent_card_json FROM agent_card"
 
     FIND_BY_OWNER = """
-        SELECT agent_card_json, owner FROM agent_card WHERE owner = %s
+        SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer FROM agent_card WHERE owner = %s
     """
 
     UPDATE_AGENT = """
@@ -699,6 +772,21 @@ class MySQLQueries(str, Enum):
 
     UPDATE_AGENT_WITH_OWNER = """
         UPDATE agent_card SET agent_card_json = %s, status = %s, updated_at = %s
+        WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
+    """
+
+    NORMALIZE_LAYER = """
+        UPDATE agent_card SET layer = 'unknown'
+        WHERE layer IS NULL OR TRIM(layer) = ''
+    """
+
+    UPDATE_AGENT_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
+        WHERE name = %s AND organization = %s
+    """
+
+    UPDATE_AGENT_WITH_OWNER_LAYER = """
+        UPDATE agent_card SET agent_card_json = %s, status = %s, layer = %s, updated_at = %s
         WHERE name = %s AND organization = %s AND (owner = %s OR owner IS NULL)
     """
 

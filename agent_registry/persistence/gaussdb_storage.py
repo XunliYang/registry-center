@@ -87,6 +87,9 @@ class GaussDBStorage(SqlStorageBackend):
         return self.pool.getconn()
 
     def _release_conn(self, conn):
+        if not conn.closed:
+            conn.rollback()
+            conn.autocommit = False
         self.pool.putconn(conn)
 
     # ---- tag param: GaussDB uses JSONB containment via cast ----

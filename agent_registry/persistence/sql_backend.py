@@ -21,6 +21,7 @@ from google.protobuf.json_format import MessageToDict, Parse
 from loguru import logger
 
 from agent_registry.model.tag import Tag
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, LAYER_UNSET, default_layer, normalize_layer
 from .base import StorageBackend, AgentRecord
 
 
@@ -323,10 +324,16 @@ class SqlStorageBackend(StorageBackend):
         tags = self._parse_tags(row[3]) if len(row) > 3 else []
         created_at = self._parse_timestamp(row[4]) if len(row) > 4 else ''
         updated_at = self._parse_timestamp(row[5]) if len(row) > 5 else ''
+        raw_layer = row[6] if len(row) > 6 else UNKNOWN_LAYER
+        try:
+            stored_layer = normalize_layer(raw_layer)
+        except ValueError:
+            stored_layer = UNKNOWN_LAYER
         return AgentRecord(
             agent_card=agent, owner=stored_owner,
             status=stored_status, tags=tags,
-            created_at=created_at, updated_at=updated_at
+            created_at=created_at, updated_at=updated_at,
+            layer=stored_layer,
         )
 
     def _row_to_tag(self, row) -> Tag:
@@ -342,9 +349,11 @@ class SqlStorageBackend(StorageBackend):
         return tag
 
     def _get_agent_fields(self, agent: AgentCard, owner: Optional[str] = None,
-                          status: str = 'published') -> tuple:
+                          status: str = 'published',
+                          layer: str = UNKNOWN_LAYER) -> tuple:
         agent_dict = MessageToDict(agent, preserving_proto_field_name=True)
         now = datetime.now(timezone.utc)
+        layer = default_layer(layer)
         return (
             agent.name,
             agent.provider.organization,
@@ -353,6 +362,7 @@ class SqlStorageBackend(StorageBackend):
             agent_dict.get('documentation_url'),
             agent_dict.get('version'),
             status,
+            layer,
             json.dumps(agent_dict.get('provider', {})),
             json.dumps(agent_dict.get('capabilities', {})) if agent_dict.get('capabilities') else None,
             json.dumps(agent_dict.get('skills', [])) if agent_dict.get('skills') else None,
@@ -366,14 +376,15 @@ class SqlStorageBackend(StorageBackend):
     # ---- StorageBackend implementation ----
 
     def create(self, agent: AgentCard, owner: Optional[str] = None,
-               status: str = 'published') -> bool:
+               status: str = 'published',
+               layer: str = UNKNOWN_LAYER) -> bool:
         existing = self.find_by_key(agent.name, agent.provider.organization)
         if existing:
             logger.warning(f"Agent already exists: {agent.name} (org={agent.provider.organization})")
             return False
         affected = self._execute_write(
             self.queries.CREATE_AGENT_WITH_OWNER.value,
-            self._get_agent_fields(agent, owner, status)
+            self._get_agent_fields(agent, owner, status, layer)
         )
         if affected > 0:
             logger.info(f"Created agent: {agent.name} (org={agent.provider.organization}, owner={owner}, status={status})")
@@ -415,13 +426,41 @@ class SqlStorageBackend(StorageBackend):
         logger.debug(f"Found {len(result)} agents (find_all)")
         return result
 
+    def find_records(self, name: Optional[str] = None,
+                     organization: Optional[str] = None,
+                     layer: Optional[str] = None,
+                     status: Optional[str] = None) -> List[AgentRecord]:
+        """Find complete registration records with storage-side filtering."""
+
+        conditions = ["1 = 1"]
+        params = []
+        ph = self.param_ph
+        if name is not None:
+            conditions.append(f"LOWER(name) LIKE LOWER({ph})")
+            params.append(f"%{name}%")
+        if organization is not None:
+            conditions.append(f"organization = {ph}")
+            params.append(organization)
+        if layer is not None:
+            conditions.append(f"layer = {ph}")
+            params.append(normalize_layer(layer))
+        if status is not None:
+            conditions.append(f"status = {ph}")
+            params.append(status)
+
+        query = (
+            "SELECT agent_card_json, owner, status, tags, created_at, updated_at, layer "
+            "FROM agent_card WHERE " + " AND ".join(conditions) +
+            " ORDER BY organization ASC, name ASC, owner IS NULL ASC, owner ASC, id ASC"
+        )
+        rows = self._execute_read_all(query, tuple(params))
+        return [self._row_to_agent_record(row) for row in rows]
+
     def find_by_owner(self, owner: str) -> List[AgentRecord]:
         rows = self._execute_read_all(self.queries.FIND_BY_OWNER.value, (owner,))
         result = []
         for row in rows:
-            agent = self._row_to_agent(row)
-            stored_owner = row[1] if len(row) > 1 else None
-            result.append(AgentRecord(agent_card=agent, owner=stored_owner))
+            result.append(self._row_to_agent_record(row))
         logger.debug(f"Found {len(result)} agents by owner '{owner}'")
         return result
 
@@ -437,7 +476,7 @@ class SqlStorageBackend(StorageBackend):
         return result
 
     def update(self, name: str, organization: str, agent_data: Dict[str, Any],
-               owner: Optional[str] = None) -> bool:
+               owner: Optional[str] = None, layer=LAYER_UNSET) -> bool:
         existing = self.find_by_key(name, organization)
         if existing is None:
             return False
@@ -448,22 +487,41 @@ class SqlStorageBackend(StorageBackend):
         # Card edits are not approval operations; preserve governance state.
         status_value = existing.status or 'published'
         now = datetime.now(timezone.utc)
+        layer_is_set = layer is not LAYER_UNSET
+        layer_value = normalize_layer(layer) if layer_is_set else None
 
         if owner is not None:
+            query = (self.queries.UPDATE_AGENT_WITH_OWNER_LAYER.value
+                     if layer_is_set else self.queries.UPDATE_AGENT_WITH_OWNER.value)
+            params = ((json.dumps(agent_dict), status_value, layer_value, now,
+                       name, organization, owner)
+                      if layer_is_set else
+                      (json.dumps(agent_dict), status_value, now,
+                       name, organization, owner))
             affected = self._execute_write(
-                self.queries.UPDATE_AGENT_WITH_OWNER.value,
-                (json.dumps(agent_dict), status_value, now, name, organization, owner)
+                query, params
             )
         else:
             if existing and existing.owner:
+                query = (self.queries.UPDATE_AGENT_WITH_OWNER_LAYER.value
+                         if layer_is_set else self.queries.UPDATE_AGENT_WITH_OWNER.value)
+                params = ((json.dumps(agent_dict), status_value, layer_value, now,
+                           name, organization, existing.owner)
+                          if layer_is_set else
+                          (json.dumps(agent_dict), status_value, now,
+                           name, organization, existing.owner))
                 affected = self._execute_write(
-                    self.queries.UPDATE_AGENT_WITH_OWNER.value,
-                    (json.dumps(agent_dict), status_value, now, name, organization, existing.owner)
+                    query, params
                 )
             else:
+                query = self.queries.UPDATE_AGENT_LAYER.value if layer_is_set else self.queries.UPDATE_AGENT.value
+                params = ((json.dumps(agent_dict), status_value, layer_value, now,
+                           name, organization)
+                          if layer_is_set else
+                          (json.dumps(agent_dict), status_value, now,
+                           name, organization))
                 affected = self._execute_write(
-                    self.queries.UPDATE_AGENT.value,
-                    (json.dumps(agent_dict), status_value, now, name, organization)
+                    query, params
                 )
         logger.info(f"Updated agent: {name} (org={organization}, owner={owner}), affected={affected}")
         return affected > 0

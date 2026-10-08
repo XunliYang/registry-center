@@ -76,6 +76,17 @@ SPDX-License-Identifier: Apache-2.0
     |------------|------|-----------------|-----------------------------------------------|-----|------|
     | agentCards | 是    | array_reference | 支持单卡或批量注册，必须为非空列表。批量注册按顺序逐卡处理，任一卡失败即中止（fail-fast），已成功注册的卡片通过错误响应的registeredAgents字段返回。详细请参见[表2](#表2-agentcard对象的参数列表)。 | -   | -    |
 
+    `agentCards`中的每个元素支持两种格式。原有格式直接填写AgentCard对象；需要声明层级时，使用下面的包装格式：
+
+    ```json
+    {
+      "agentCard": { "name": "...", "provider": { "organization": "..." } },
+      "layer": "vendor-defined-layer"
+    }
+    ```
+
+    `layer`为可选字符串，最长64个字符，服务端会去除首尾空白后保存。未提供时按`unknown`保存。原有直接填写AgentCard的格式继续有效，注册响应也保持原有结构。
+
   <a id="表2-agentcard对象的参数列表"></a>**表2** AgentCard对象的参数列表
     
     | 参数名称                | 是否必选 | 类型              | 值域                                                                 | 默认值 | 描述         |
@@ -298,6 +309,7 @@ SPDX-License-Identifier: Apache-2.0
     |--------------|--------|----|-----|------------------------------|
     | name         | string | 否  | -   | Agent 名称，进行模糊匹配（子串）查询。不区分大小写。 |
     | organization | string | 否  | -   | 组织机构名称，进行精确匹配查询。支持大小写敏感匹配。   |
+    | layer        | string | 否  | -   | 按注册层级精确匹配。层级为非空字符串，最长64个字符，大小写按原值匹配。 |
 
 - 请求示例
 
@@ -329,6 +341,14 @@ SPDX-License-Identifier: Apache-2.0
 
     ```json
     GET /rest/v1/registry-center/agent-cards?name=RAN%20Energy%20Saving%20Agent&organization=Org HTTP/1.1
+    Host: your-domain.com
+    Content-Type: application/json
+    ```
+
+  - 按层级查询
+
+    ```json
+    GET /rest/v1/registry-center/agent-cards?layer=OMC HTTP/1.1
     Host: your-domain.com
     Content-Type: application/json
     ```
@@ -801,11 +821,13 @@ SPDX-License-Identifier: Apache-2.0
 
     | 参数名  | 类型     | 必填 | 默认值 | 描述                                     |
     |------|--------|----|-----|----------------------------------------|
-    | task | string | 是  | -   | 非空白的自然语言任务描述，最多 10,000 个字符。 |
+    | task | string | 是  | -   | 自然语言任务描述，用于语义检索相关Agent。例如："需要查询意图报告"等。 |
+    | layer | string | 否  | -   | 按注册层级过滤候选Agent。层级为非空字符串，最长64个字符，大小写按原值匹配。 |
+    | topN | integer | 否 | 10 | 集成端口使用的返回数量上限，取值范围 1–50；主端口使用查询参数 `top_n`。 |
 
-  主端口使用查询参数 `top_n`（默认 10，整数 1–50）；集成端口使用 JSON
-  字段 `topN`，默认值及范围相同。集成端口不接受布尔值、小数或数字字符串，
-  不再强制转换或截断。不合法的任务描述或数量参数在模型调用前返回 422。
+  `task` 必须为非空白字符串，最多 10,000 个字符。集成端口不接受布尔值、
+  小数或数字字符串作为 `topN`，不再强制转换或截断。不合法的任务描述或数量
+  参数在模型调用前返回 422。
 
 - 请求示例
 
@@ -911,6 +933,221 @@ SPDX-License-Identifier: Apache-2.0
   | 200 | 查询成功（无匹配Agent时返回空agentCards列表）。 |
   | 500 | 查询失败，服务内部错误。   |
   | 503 | 服务繁忙。          |
+
+## 查询带层级的AgentCard
+
+- 典型场景
+
+    调用方需要按注册层级筛选Agent，并同时获取AgentCard及其注册元数据时，使用该接口。
+
+- 功能描述
+
+    按层级、分页参数查询已发布且健康的Agent。`layer`缺省时不限制层级；提供`layer`时按字符串精确匹配。响应中的`agentCard`内容与注册时保存的AgentCard一致，层级作为同级字段返回。
+
+- 调用方法
+
+    POST
+
+- URI
+
+    */rest/v1/registry-center/agent-cards-with-layer*
+
+- 请求参数
+
+  <a id="带层级普通查询body参数"></a>**带层级普通查询** body参数列表
+
+    | 参数名 | 类型 | 必填 | 默认值 | 描述 |
+    |------|------|------|------|------|
+    | layer | string | 否 | - | 注册层级。非空字符串，最长64个字符，大小写按原值匹配。 |
+    | limit | integer | 否 | 100 | 返回数量，取值范围1~1000。 |
+    | offset | integer | 否 | 0 | 起始偏移量，不能小于0。 |
+
+- 请求示例
+
+    ```json
+    POST /rest/v1/registry-center/agent-cards-with-layer HTTP/1.1
+    Host: your-domain.com
+    Content-Type: application/json
+
+    {
+      "layer": "OMC",
+      "limit": 20,
+      "offset": 0
+    }
+    ```
+
+- 响应参数
+
+    <a id="带层级普通查询响应参数"></a>**带层级普通查询** 响应参数列表
+
+    | 参数名 | 类型 | 描述 |
+    |------|------|------|
+    | agents | array | Agent条目列表，条目结构见下表。 |
+    | agents[].agentCard | object | AgentCard对象，结构参见[表2](#表2-agentcard对象的参数列表)。 |
+    | agents[].layer | string | 注册时保存的层级；旧数据未声明层级时为`unknown`。 |
+    | count | integer | 本次实际返回的条目数。 |
+    | hasMore | boolean | 是否还有下一页。 |
+
+- 响应样例
+
+    ```json
+    {
+      "agents": [
+        {
+          "agentCard": {
+            "name": "RAN Energy Saving Agent",
+            "provider": { "organization": "Org", "url": "" }
+          },
+          "layer": "OMC"
+        }
+      ],
+      "count": 1,
+      "hasMore": false
+    }
+    ```
+
+- 状态码
+
+  | 状态码 | 说明 |
+  |--------|------|
+  | 200 | 查询成功。无匹配Agent时返回空`agents`列表。 |
+  | 422 | 请求参数不合法。 |
+  | 500 | 查询失败，服务内部错误。 |
+  | 503 | 数据存储尚未完成层级迁移或服务繁忙。 |
+
+## 查询带层级的AgentCard详情
+
+- 典型场景
+
+    调用方已经知道Agent的组织和名称，需要同时获取AgentCard及其注册层级。
+
+- 功能描述
+
+    按`organization`和`name`精确查询一个已发布且健康的Agent。查询不到时返回404。
+
+- 调用方法
+
+    GET
+
+- URI
+
+    */rest/v1/registry-center/agent-cards-with-layer/{organization}/{name}*
+
+- 请求参数
+
+    路径参数与[查询指定AgentCard](#查询指定agentcard)相同。
+
+- 请求示例
+
+    ```json
+    GET /rest/v1/registry-center/agent-cards-with-layer/Org/RAN%20Energy%20Saving%20Agent HTTP/1.1
+    Host: your-domain.com
+    Content-Type: application/json
+    ```
+
+- 响应参数
+
+    | 参数名 | 类型 | 描述 |
+    |------|------|------|
+    | agentCard | object | AgentCard对象，结构参见[表2](#表2-agentcard对象的参数列表)。 |
+    | layer | string | 注册时保存的层级；旧数据未声明层级时为`unknown`。 |
+
+- 响应样例
+
+    ```json
+    {
+      "agentCard": {
+        "name": "RAN Energy Saving Agent",
+        "provider": { "organization": "Org", "url": "" }
+      },
+      "layer": "OMC"
+    }
+    ```
+
+- 状态码
+
+  | 状态码 | 说明 |
+  |--------|------|
+  | 200 | 查询成功。 |
+  | 404 | Agent不存在、未发布或不健康。 |
+  | 503 | 服务繁忙。 |
+
+## 按层级语义检索AgentCard
+
+- 典型场景
+
+    调用方需要根据自然语言任务描述检索Agent，并将候选范围限制在指定注册层级内。
+
+- 功能描述
+
+    接口先按`layer`限定候选范围，再执行原有语义检索流程。未提供`layer`时检索所有层级。语义检索依赖LLM服务，配置及异常处理与[按语义检索AgentCard](#按语义检索agentcard)相同。
+
+- 调用方法
+
+    POST
+
+- URI
+
+    */rest/v1/registry-center/agent-cards-with-layer/semantic-query*
+
+- 请求参数
+
+  <a id="带层级语义查询body参数"></a>**带层级语义查询** body参数列表
+
+    | 参数名 | 类型 | 必填 | 默认值 | 描述 |
+    |------|------|------|------|------|
+    | task | string | 是 | - | 自然语言任务描述。 |
+    | layer | string | 否 | - | 注册层级。非空字符串，最长64个字符，大小写按原值匹配。 |
+    | topN | integer | 否 | 10 | 返回数量，取值范围1~50。 |
+
+- 请求示例
+
+    ```json
+    POST /rest/v1/registry-center/agent-cards-with-layer/semantic-query HTTP/1.1
+    Host: your-domain.com
+    Content-Type: application/json
+
+    {
+      "task": "需要查询意图报告",
+      "layer": "domain-workbench",
+      "topN": 10
+    }
+    ```
+
+- 响应参数
+
+    | 参数名 | 类型 | 描述 |
+    |------|------|------|
+    | agents | array | 匹配结果列表，条目结构为`agentCard`和`layer`。 |
+    | agents[].agentCard | object | AgentCard对象，结构参见[表2](#表2-agentcard对象的参数列表)。 |
+    | agents[].layer | string | 注册时保存的层级。 |
+    | count | integer | 本次实际返回的条目数。 |
+
+- 响应样例
+
+    ```json
+    {
+      "agents": [
+        {
+          "agentCard": {
+            "name": "RAN Energy Saving Agent",
+            "provider": { "organization": "Org", "url": "" }
+          },
+          "layer": "domain-workbench"
+        }
+      ],
+      "count": 1
+    }
+    ```
+
+- 状态码
+
+  | 状态码 | 说明 |
+  |--------|------|
+  | 200 | 查询成功。无匹配Agent时返回空`agents`列表。 |
+  | 422 | 请求参数不合法。 |
+  | 500 | 查询失败，服务内部错误。 |
+  | 503 | 数据存储尚未完成层级迁移或服务繁忙。 |
 
 ## 获取公钥信息
 
