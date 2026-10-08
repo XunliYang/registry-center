@@ -22,6 +22,8 @@ introspection endpoint are stubbed at the provider boundary."""
 
 import pytest
 import httpx
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import agent_registry.integration.authn as authn_module
 from agent_registry.integration.authn import (
@@ -54,7 +56,7 @@ def _jwt_provider():
 def _introspection_provider(client, **overrides):
     kwargs = dict(endpoint=INTROSPECTION_URI, client_id="client",
                   client_secret="secret", issuer=ISSUER, audience=AUDIENCE,
-                  mapper=_mapper(), client=client)
+                  mapper=_mapper(), client=client, cache_seconds=30)
     kwargs.update(overrides)
     return IntrospectionBearerProvider(**kwargs)
 
@@ -67,6 +69,9 @@ class _FakeClock:
         self.now = now
 
     def time(self):
+        return self.now
+
+    def monotonic(self):
         return self.now
 
     def advance(self, seconds):
@@ -89,6 +94,14 @@ class _StubIntrospectionClient:
             return httpx.Response(self._status_code, request=self._request)
         return httpx.Response(self._status_code, json=self._payload,
                               request=self._request)
+
+    @asynccontextmanager
+    async def stream(self, *args, **kwargs):
+        response = await self.post(*args, **kwargs)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
 
 def _active_payload(clock, **overrides):
@@ -124,7 +137,7 @@ class TestJwtBearerProviderAuthenticate:
     async def test_missing_sub_claim_is_rejected(self, monkeypatch):
         provider = _jwt_provider()
         monkeypatch.setattr(provider, "_decode",
-                            lambda token: {"scope": "registry.read"})
+                            AsyncMock(return_value={"scope": "registry.read"}))
         with pytest.raises(AuthenticationError) as exc:
             await provider.authenticate(Credential("bearer", "jwt"),
                                         AuthenticationContext("ip"))
@@ -134,8 +147,8 @@ class TestJwtBearerProviderAuthenticate:
     async def test_conflicting_mapped_scopes_are_rejected(self, monkeypatch):
         provider = _jwt_provider()
         monkeypatch.setattr(provider, "_decode",
-                            lambda token: {"sub": "partner",
-                                           "scope": "registry.read registry.audit"})
+                            AsyncMock(return_value={"sub": "partner",
+                                           "scope": "registry.read registry.audit"}))
         with pytest.raises(AuthenticationError) as exc:
             await provider.authenticate(Credential("bearer", "jwt"),
                                         AuthenticationContext("ip"))
@@ -145,8 +158,8 @@ class TestJwtBearerProviderAuthenticate:
     async def test_unmapped_scopes_yield_no_role_and_are_rejected(self, monkeypatch):
         provider = _jwt_provider()
         monkeypatch.setattr(provider, "_decode",
-                            lambda token: {"sub": "partner",
-                                           "scope": "registry.unknown"})
+                            AsyncMock(return_value={"sub": "partner",
+                                           "scope": "registry.unknown"}))
         with pytest.raises(AuthenticationError) as exc:
             await provider.authenticate(Credential("bearer", "jwt"),
                                         AuthenticationContext("ip"))
@@ -156,8 +169,8 @@ class TestJwtBearerProviderAuthenticate:
     async def test_jwks_outage_maps_to_uniform_error_without_internals(self, monkeypatch):
         provider = _jwt_provider()
 
-        def _outage(token):
-            raise ConnectionError("jwks-endpoint-unreachable-marker")
+        async def _outage(token):
+            raise authn_module.jwt.PyJWKClientConnectionError("jwks-endpoint-unreachable-marker")
 
         monkeypatch.setattr(provider._jwks, "get_signing_key_from_jwt", _outage)
         with pytest.raises(AuthenticationError) as exc:

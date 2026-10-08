@@ -20,19 +20,25 @@
 import asyncio
 import hashlib
 import hmac
+import json
+import math
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
-from urllib.parse import urlparse
 
 import httpx
 import jwt
 
 from agent_registry.integration.credentials import CredentialEntry, load_credentials
+from agent_registry.integration.jwks import VerifiedJwkClient
+from agent_registry.integration.oauth_transport import (
+    client_basic_auth, iam_client, require_https_endpoint, require_timeout,
+)
 from common.custom.custom_handle import BaseHandler, HandlerRegistry
 from common.custom.interface_type import InterfaceType
-from common.util.app_config import get_conf
+from common.util.app_config import get_conf, resolve_env_vars
 from common.util.authenticate_util import (
     AUTH_METHOD_CERTIFICATE, AUTH_METHOD_OAUTH2_INTROSPECTION,
     AUTH_METHOD_OAUTH2_JWT, AUTH_METHOD_STATIC_BEARER,
@@ -45,7 +51,7 @@ _FAIL = "Authentication failed"
 @dataclass(frozen=True)
 class Credential:
     kind: str
-    value: str = ''
+    value: str = field(default='', repr=False)
     peer_certificate: Optional[dict] = None
     fingerprint: str = ''
 
@@ -103,6 +109,10 @@ class AuthenticationProvider(ABC):
     async def authenticate(self, credential: Credential,
                            context: AuthenticationContext) -> Principal:
         raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release provider-owned transports at integration listener shutdown."""
+        pass
 
 
 class AuthenticationProviderRegistry:
@@ -181,26 +191,27 @@ class JwtBearerProvider(AuthenticationProvider):
     credential_kind = 'bearer'
 
     def __init__(self, issuer: str, audience: str, jwks_uri: str,
-                 algorithms: Iterable[str], mapper: ScopeRoleMapper):
+                 algorithms: Iterable[str], mapper: ScopeRoleMapper,
+                 timeout: float = 3.0, ca_file: str = ''):
         if not issuer or not audience or not jwks_uri:
             raise ValueError("JWT issuer, audience and jwks_uri are required")
-        if urlparse(jwks_uri).scheme != 'https':
-            raise ValueError("JWKS URI must use HTTPS")
+        require_https_endpoint(jwks_uri)
+        require_timeout(timeout)
         self.issuer, self.audience, self.algorithms = issuer, audience, list(algorithms)
         if not self.algorithms or any(a.strip().lower() == 'none' for a in self.algorithms):
             raise ValueError("At least one safe JWT algorithm is required")
-        self._jwks = jwt.PyJWKClient(jwks_uri, cache_jwk_set=True, lifespan=300)
+        self._jwks = VerifiedJwkClient(jwks_uri, timeout, ca_file)
         self._mapper = mapper
 
-    def _decode(self, token: str) -> dict:
-        key = self._jwks.get_signing_key_from_jwt(token)
-        return jwt.decode(token, key.key, algorithms=self.algorithms,
+    async def _decode(self, token: str) -> dict:
+        key = await self._jwks.get_signing_key_from_jwt(token)
+        return await asyncio.to_thread(jwt.decode, token, key.key, algorithms=self.algorithms,
                           issuer=self.issuer, audience=self.audience,
                           options={'require': ['exp', 'iss', 'aud', 'sub']})
 
     async def authenticate(self, credential: Credential, context: AuthenticationContext) -> Principal:
         try:
-            claims = await asyncio.to_thread(self._decode, credential.value)
+            claims = await self._decode(credential.value)
             scopes = _parse_scopes(claims.get('scope', ''))
             return _principal(context, subject=str(claims['sub']), method=AUTH_METHOD_OAUTH2_JWT,
                               credential_id=f"{self.issuer}:{claims.get('client_id', claims['sub'])}",
@@ -209,8 +220,13 @@ class JwtBearerProvider(AuthenticationProvider):
                               tenant=str(claims.get('tenant', '')))
         except AuthenticationError:
             raise
+        except jwt.PyJWKClientConnectionError as exc:
+            raise AuthenticationError(AuthFailureReason.PROVIDER_UNAVAILABLE, _FAIL) from exc
         except Exception as exc:
             raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL) from exc
+
+    async def aclose(self) -> None:
+        await self._jwks.aclose()
 
 
 class IntrospectionBearerProvider(AuthenticationProvider):
@@ -219,55 +235,96 @@ class IntrospectionBearerProvider(AuthenticationProvider):
 
     def __init__(self, endpoint: str, client_id: str, client_secret: str,
                  issuer: str, audience: str, mapper: ScopeRoleMapper,
-                 timeout: float = 3.0, cache_seconds: int = 30,
-                 client: Optional[httpx.AsyncClient] = None):
-        if urlparse(endpoint).scheme != 'https':
-            raise ValueError("Introspection endpoint must use HTTPS")
-        if not client_id or not client_secret:
-            raise ValueError("Introspection client credentials are required")
+                 timeout: float = 3.0, cache_seconds: int = 0,
+                 client: Optional[httpx.AsyncClient] = None,
+                 cache_max_entries: int = 1024, ca_file: str = ''):
+        require_https_endpoint(endpoint)
+        require_timeout(timeout)
+        if not client_id or not client_secret or not issuer or not audience:
+            raise ValueError("Introspection credentials, issuer and audience are required")
+        if not 0 <= cache_seconds <= 60 or cache_max_entries <= 0:
+            raise ValueError('Introspection cache TTL must be 0..60 seconds and capacity positive')
         self.endpoint, self.client_id, self.client_secret = endpoint, client_id, client_secret
         self.issuer, self.audience, self.mapper = issuer, audience, mapper
         self.timeout, self.cache_seconds = timeout, cache_seconds
-        self.client = client or httpx.AsyncClient()
-        self._cache: Dict[str, tuple] = {}
+        self._owns_client = client is None
+        self.client = client if client is not None else iam_client(ca_file)
+        self.cache_max_entries = cache_max_entries
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
 
     async def authenticate(self, credential: Credential, context: AuthenticationContext) -> Principal:
-        now = time.time()
-        cached = self._cache.get(credential.fingerprint)
-        if cached and cached[0] > now:
+        key = credential.fingerprint or hashlib.sha256(credential.value.encode()).hexdigest()
+        monotonic_now = time.monotonic()
+        for stale in [k for k, entry in self._cache.items() if entry[0] <= monotonic_now]:
+            self._cache.pop(stale, None)
+        cached = self._cache.get(key) if self.cache_seconds else None
+        if cached:
             data = cached[1]
+            self._cache.move_to_end(key)
         else:
             try:
-                response = await self.client.post(self.endpoint, data={'token': credential.value},
-                                                  auth=(self.client_id, self.client_secret),
-                                                  timeout=self.timeout)
-                response.raise_for_status()
-                data = response.json()
+                async with asyncio.timeout(self.timeout):
+                    async with self.client.stream(
+                            'POST', self.endpoint, data={'token': credential.value},
+                            auth=client_basic_auth(self.client_id, self.client_secret),
+                            timeout=self.timeout, follow_redirects=False) as response:
+                        response.raise_for_status()
+                        body = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            body.extend(chunk)
+                            if len(body) > 65536:
+                                raise ValueError('Introspection response too large')
+                        data = json.loads(body)
             except Exception as exc:
                 raise AuthenticationError(AuthFailureReason.PROVIDER_UNAVAILABLE, _FAIL) from exc
-            if not isinstance(data, dict) or data.get('active') is not True:
-                raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
-            try:
-                expiry = float(data.get('exp', now + self.cache_seconds))
-                nbf = float(data.get('nbf', 0))
-            except (TypeError, ValueError) as exc:
-                raise AuthenticationError(
-                    AuthFailureReason.INVALID_TOKEN, _FAIL) from exc
-            if expiry <= now or nbf > now:
-                raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
-            self._cache[credential.fingerprint] = (min(now + self.cache_seconds, expiry), data)
-        if self.issuer and data.get('iss') != self.issuer:
+        # Re-evaluate wall-clock expiry after network I/O and on every cache hit.
+        now = time.time()
+        if not isinstance(data, dict) or type(data.get('active')) is not bool:
+            raise AuthenticationError(AuthFailureReason.PROVIDER_UNAVAILABLE, _FAIL)
+        if data['active'] is not True:
+            raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
+        try:
+            expiry = _numeric_date(data['exp']) if 'exp' in data else None
+            nbf = _numeric_date(data.get('nbf', 0))
+        except (TypeError, ValueError) as exc:
+            self._cache.pop(key, None)
+            raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL) from exc
+        if (expiry is not None and expiry <= now) or nbf > now:
+            self._cache.pop(key, None)
+            raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
+        if data.get('iss') != self.issuer:
             raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
         audiences = data.get('aud', [])
         audiences = [audiences] if isinstance(audiences, str) else audiences
-        if self.audience and self.audience not in audiences:
+        if not isinstance(audiences, list) or self.audience not in audiences:
             raise AuthenticationError(AuthFailureReason.INVALID_TOKEN, _FAIL)
         scopes = _parse_scopes(data.get('scope', ''))
         subject = str(data.get('sub') or data.get('client_id') or '')
-        return _principal(context, subject=subject, method=AUTH_METHOD_OAUTH2_INTROSPECTION,
+        principal = _principal(context, subject=subject, method=AUTH_METHOD_OAUTH2_INTROSPECTION,
                           credential_id=f"{self.issuer}:{data.get('client_id', subject)}",
                           role=self.mapper.role_for(scopes), issuer=self.issuer,
                           client_id=str(data.get('client_id', '')), scopes=scopes)
+        # Only validated results with an explicit expiry are eligible for caching.
+        if not cached and self.cache_seconds and expiry is not None:
+            claims = {name: data[name] for name in
+                      ('active', 'sub', 'client_id', 'scope', 'iss', 'aud', 'exp', 'nbf') if name in data}
+            self._cache[key] = (time.monotonic() + min(self.cache_seconds, expiry - now), claims)
+            while len(self._cache) > self.cache_max_entries:
+                self._cache.popitem(last=False)
+        return principal
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+
+def _numeric_date(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError('Invalid numeric date')
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError('Invalid numeric date')
+    return result
 
 
 class MtlsProvider(AuthenticationProvider):
@@ -306,10 +363,11 @@ def _scope_mapping(conf: Mapping[str, Any]) -> Dict[str, str]:
 
 class ThirdPartyAuthnHandler(BaseHandler):
     def __init__(self, credential_file: str = '', config: Optional[Mapping[str, Any]] = None):
-        conf = config if config is not None else get_conf()
+        conf = resolve_env_vars(dict(config if config is not None else get_conf()))
         self.mode = str(conf.get('integration.auth.mode', 'static_bearer'))
         fingerprint_key = str(conf.get('integration.auth.fingerprint_key', ''))
-        tokens, certs = load_credentials(credential_file or str(conf.get('integration.credential.file', '')))
+        path = resolve_env_vars({'path': credential_file})['path'] if credential_file else str(conf.get('integration.credential.file', ''))
+        tokens, certs = load_credentials(path)
         if self.mode == 'mtls':
             self.extractors = [TlsPeerCertificateExtractor()]
         elif self.mode in _CUSTOM_EXTRACTORS:
@@ -329,7 +387,9 @@ class ThirdPartyAuthnHandler(BaseHandler):
                 str(conf.get('integration.oauth2.issuer', '')),
                 str(conf.get('integration.oauth2.audience', '')),
                 str(conf.get('integration.oauth2.jwks_uri', '')),
-                [a.strip() for a in str(conf.get('integration.oauth2.algorithms', 'RS256')).split(',')], mapper))
+                [a.strip() for a in str(conf.get('integration.oauth2.algorithms', 'RS256')).split(',')], mapper,
+                float(conf.get('integration.oauth2.timeout_seconds', 3)),
+                str(conf.get('integration.oauth2.ca_file', ''))))
         elif self.mode == 'oauth2_introspection':
             self.registry.register(IntrospectionBearerProvider(
                 str(conf.get('integration.oauth2.introspection_uri', '')),
@@ -338,7 +398,9 @@ class ThirdPartyAuthnHandler(BaseHandler):
                 str(conf.get('integration.oauth2.issuer', '')),
                 str(conf.get('integration.oauth2.audience', '')), mapper,
                 float(conf.get('integration.oauth2.timeout_seconds', 3)),
-                int(conf.get('integration.oauth2.cache_seconds', 30))))
+                int(conf.get('integration.oauth2.cache_seconds', 0)),
+                cache_max_entries=int(conf.get('integration.oauth2.cache_max_entries', 1024)),
+                ca_file=str(conf.get('integration.oauth2.ca_file', ''))))
         elif self.mode in _CUSTOM_PROVIDERS:
             self.extractors = [_CUSTOM_EXTRACTORS[self.mode], TlsPeerCertificateExtractor()]
         elif self.mode != 'mtls':
@@ -364,6 +426,11 @@ class ThirdPartyAuthnHandler(BaseHandler):
         if provider.credential_kind != credential.kind:
             raise AuthenticationError(AuthFailureReason.INVALID_CREDENTIALS, _FAIL)
         return await provider.authenticate(credential, AuthenticationContext(client_ip))
+
+    async def aclose(self) -> None:
+        # Custom providers are externally registered/owned, not disposed here.
+        if self.mode not in _CUSTOM_PROVIDERS:
+            await self.registry.get(self.mode).aclose()
 
 
 def register_default() -> None:

@@ -153,7 +153,8 @@ class CustomUvicornServer:
             ssl_ca_certs=self.conf_obj.ssl_ca_certs,
             ssl_cert_reqs=self.conf_obj.verify_client,
             ssl_ciphers=CipherConverter.convert(self.server_config.get(TLS_CIPHER)),
-            timeout_keep_alive=0,
+            # Use Uvicorn's finite HTTP idle timeout. Zero races pooled clients;
+            # this timer starts after a response completes, not during SSE.
             timeout_graceful_shutdown=int(self.server_config.get(CONN_TIMEOUT, 30)),
             log_level="info",
             proxy_headers=True
