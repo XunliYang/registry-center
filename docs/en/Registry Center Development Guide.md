@@ -523,6 +523,8 @@ The Registry Center provides a CLI command-line tool for local management of Age
 
 The Registry Center supports Agent heartbeat detection and change broadcast: Agents periodically report liveness, and the Registry Center maintains health status (healthy/suspect/offline) based on the failure threshold. Registry data changes (registration, update, deregistration, health changes) are pushed to subscribers via webhooks in real time, with a version-based reconciliation API. Both capabilities are disabled by default and must be enabled in server.conf; once enabled, they are fully backward compatible with existing deployments.
 
+Switches belong in `etc/conf/server.conf`; heartbeat periods, failure thresholds, rate limits and notification delivery policies belong in `etc/conf/server.properties`. The initialization wizard configures deployment and switches, without rewriting business policies.
+
 ### Development Steps
 
 1. Enable the capabilities (etc/conf/server.conf)
@@ -1011,7 +1013,7 @@ Note: the owner/identity rows above are the values shipped in the sample
 | postgresql.port | PostgreSQL port | 5432 |
 | postgresql.name | Database name | registry_center |
 
-#### server.properties Configuration Items (Advanced)
+#### server.properties Configuration Items (Operating Parameters and Business Policies)
 
  The following configuration is in `etc/conf/server.properties`:
 

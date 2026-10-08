@@ -103,6 +103,9 @@ python -m agent_registry.init    # 选择 enable_https = false
 python -m agent_registry.start   # 启动在 http://127.0.0.1:5000
 ```
 
+Docker/Podman 打包、运行时凭据挂载、端口优先级及非交互初始化请参阅
+[容器部署指南](docs/container-deployment.md)。
+
 ### 注册第一个 Agent
 
 ```bash
@@ -196,11 +199,17 @@ flowchart TB
 
 | 配置文件 | 用途 |
 |----------|------|
-| `etc/conf/server.conf` | 服务 IP、端口、TLS 证书、签名验证、审核开关、所有者隔离 |
-| `etc/conf/server.properties` | TLS 协议版本、密码套件、连接/超时/流控参数 |
+| `etc/conf/server.conf` | 功能开关与部署接入信息：IP、端口、TLS/凭据引用、IAM 地址和身份模式 |
+| `etc/conf/server.properties` | 运行参数与业务策略：TLS 协议/密码套件、资源限额、心跳周期、通知重试及 OAuth 缓存/scope 策略 |
 | `etc/conf/persistence.conf` | 存储后端：`file`（默认）、`postgresql` |
 | `etc/conf/log_config.conf` | 审计日志轮转参数（文件大小、备份数量） |
 | `.env` | 本地密钥（Git 忽略）；模型定义见 `etc/config/models.yaml` |
+
+同一键只放在一个服务配置文件。加载顺序仍为 `server.conf` →
+`server.properties` → `REGISTRY_*` 环境变量。重复定义会告警（只输出键名），
+同时保留后加载值覆盖的历史行为。迁移时将**实际生效值**移到 `server.properties`，
+再删除旧定义，不用模板默认值覆盖现场策略。初始化向导只修改部署信息和开关。
+镜像从公开 `server.conf.example` 与 `server.properties` 初始化，不读取本地部署凭据。
 
 模型定义放在本地（Git 忽略）的 `etc/config/models.yaml`，密钥来自环境变量或
 `.env`：每条模型条目用 `provider`（默认 `openai_compatible`，`openai` 为旧别名）、`model`、`url` 描述，并用
