@@ -45,6 +45,7 @@ class GaussDBStorage(SqlStorageBackend):
 
     queries = GaussDBQueries
     _integrity_error = psycopg2.IntegrityError
+    dialect = "gaussdb"
 
     def __init__(self, conn_pool: pool.ThreadedConnectionPool):
         self.pool = conn_pool
@@ -86,6 +87,9 @@ class GaussDBStorage(SqlStorageBackend):
         return self.pool.getconn()
 
     def _release_conn(self, conn):
+        if not conn.closed:
+            conn.rollback()
+            conn.autocommit = False
         self.pool.putconn(conn)
 
     # ---- tag param: GaussDB uses JSONB containment via cast ----

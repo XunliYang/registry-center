@@ -29,6 +29,9 @@ covered by tests/test_signature.py and is intentionally not repeated here.
 import base64
 import json
 import os
+from unittest.mock import AsyncMock, MagicMock
+from fastapi.testclient import TestClient
+from google.protobuf.json_format import MessageToDict, ParseDict
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -72,15 +75,12 @@ def signer_keys():
     return _generate_rsa_key(), _generate_rsa_key()
 
 
-def _jwk(kid, n_b64, e_b64, include_x=True):
+def _jwk(kid, n_b64, e_b64, include_x=False):
     """JWK dict matching the registry's PublicKeyManager file layout."""
     jwk = {"kty": "RSA", "kid": kid, "use": "sig", "alg": "RS256",
            "n": n_b64, "e": e_b64}
     if include_x:
-        # The registry JWK model requires `x` even for RSA keys (models.py
-        # documents x as "modulus (RSA)"), so operator files must duplicate
-        # the modulus into x. See TestKnownSignaturePathDefects for what
-        # happens with a standard RFC 7517 RSA JWK that only carries n/e.
+        # Legacy operator files duplicated n into x; continue accepting them.
         jwk["x"] = n_b64
     return jwk
 
@@ -231,18 +231,10 @@ class TestUnsupportedAlgorithm:
         assert result.error_message
 
 
-class TestKnownSignaturePathDefects:
-    """xfail-marked tests documenting source defects (do not fix here)."""
+class TestSignaturePathRegressions:
+    """Real signed cards exercise previously broken interoperability paths."""
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="SOURCE BUG (agent_card_signature_validator.py): the jku fallback wraps "
-               "fetch_jku_key in asyncio.run(), but validate_agent_card is called from the "
-               "async registration flow (_process_register_cards in agent_registry/server.py) "
-               "where a loop is already running, so asyncio.run() always raises RuntimeError; "
-               "the validator masks it and returns SIG005, meaning jku-based verification can "
-               "never succeed over the HTTP registration API.",
-        strict=False)
     async def test_jku_verification_from_async_context(self, signer_keys, monkeypatch):
         (pem, n_b64, e_b64), _ = signer_keys
 
@@ -256,18 +248,9 @@ class TestKnownSignaturePathDefects:
             JWKFetcher(public_key_manager=None, jwk_allowlist="keys.example.com"))
         # Production calls this on the event loop (async request handler);
         # a correct implementation must verify the card successfully there.
-        result = validator.validate_agent_card(card)
+        result = await validator.validate_agent_card_async(card)
         assert result.is_valid, (result.error_code, result.error_message)
 
-    @pytest.mark.xfail(
-        reason="SOURCE BUG: PyJWT 2.10.1 RSAAlgorithm.prepare_key(None) raises "
-               "TypeError(\"Expecting a PEM-formatted key.\"), which is NOT a PyJWTError, so it "
-               "escapes a2a create_signature_verifier's per-signature `except PyJWTError: "
-               "continue` and aborts the whole verification loop; the validator's "
-               "`except TypeError` masks it into SIG005. A card whose FIRST signature references "
-               "a kid with no backend key is rejected even though a later signature verifies "
-               "against a provisioned backend key.",
-        strict=False)
     def test_card_with_valid_later_backend_signature_is_accepted(self, signer_keys, jwks_base):
         (backend_pem, n_b64, e_b64), (foreign_pem, _, _) = signer_keys
         _write_backend_jwks(jwks_base, _jwk("backend-key-2", n_b64, e_b64))
@@ -277,12 +260,6 @@ class TestKnownSignaturePathDefects:
         result = _validator().validate_agent_card(card)
         assert result.is_valid, (result.error_code, result.error_message)
 
-    @pytest.mark.xfail(
-        reason="SOURCE BUG: signature/models.py JWK requires `x` even for RSA keys (standard "
-               "RFC 7517 RSA JWKs carry only n/e), and PublicKeyManager._load_jwks swallows the "
-               "pydantic ValidationError and returns an empty JWKS, silently discarding ALL keys "
-               "in the file.",
-        strict=False)
     def test_standard_rsa_jwks_without_x_is_loadable(self, signer_keys, jwks_base):
         (pem, n_b64, e_b64), _ = signer_keys
         path = _write_backend_jwks(jwks_base, _jwk(BACKEND_KID, n_b64, e_b64,
@@ -290,3 +267,45 @@ class TestKnownSignaturePathDefects:
         assert StoragePath.is_valid_path(path)
         jwk = PublicKeyManager().get_public_key(ORG, AGENT, BACKEND_KID)
         assert jwk is not None, "standard RSA JWK (n/e only) must be loadable"
+
+    def test_malformed_first_signature_does_not_hide_valid_later_signature(self, signer_keys, jwks_base):
+        (pem, n_b64, e_b64), _ = signer_keys
+        _write_backend_jwks(jwks_base, _jwk(BACKEND_KID, n_b64, e_b64))
+        card = _make_card()
+        card.signatures.add(protected='not-json', signature='invalid')
+        _sign(card, pem, BACKEND_KID)
+        original = card.SerializeToString()
+        assert _validator().validate_agent_card(card).is_valid
+        assert card.SerializeToString() == original
+
+    def test_rsa_jwk_without_optional_algorithm_is_verified(self, signer_keys, jwks_base):
+        (pem, n_b64, e_b64), _ = signer_keys
+        key = _jwk(BACKEND_KID, n_b64, e_b64)
+        key.pop('alg')
+        _write_backend_jwks(jwks_base, key)
+        assert _validator().validate_agent_card(_sign(_make_card(), pem, BACKEND_KID)).is_valid
+
+    def test_jku_signed_card_can_register_through_http(self, signer_keys, monkeypatch):
+        from agent_registry import server
+        from test_server_endpoints import VALID_AGENT_CARD
+        (pem, n_b64, e_b64), _ = signer_keys
+        fetcher = JWKFetcher(jwk_allowlist='keys.example.com')
+        fetcher.fetch_jku_key = AsyncMock(return_value=PyJWK(_jwk(BACKEND_KID, n_b64, e_b64)))
+        validator = AgentCardSignatureValidator(fetcher)
+        card = _sign(ParseDict(VALID_AGENT_CARD, AgentCard()), pem, BACKEND_KID, jku=JKU)
+        registry = MagicMock()
+        registry.count.return_value = 0
+        registry.get_agents.return_value = {}
+        monkeypatch.setattr(server, 'OWNER_ISOLATION_ENABLED', False)
+        monkeypatch.setattr('common.custom.custom_handle.HandlerRegistry.get_handler',
+                            lambda kind: MagicMock(handle=AsyncMock(return_value=True)))
+        server.app.dependency_overrides[server.get_registry] = lambda: registry
+        server.app.dependency_overrides[server.get_signature_validator] = lambda: validator
+        server.app.dependency_overrides[server.get_registry_signer] = lambda: None
+        try:
+            response = TestClient(server.app).post('/rest/v1/registry-center/agent-cards',
+                                                  json={'agentCards': [MessageToDict(card)]})
+            assert response.status_code == 201, response.text
+            fetcher.fetch_jku_key.assert_awaited_once_with(BACKEND_KID, JKU)
+        finally:
+            server.app.dependency_overrides.clear()

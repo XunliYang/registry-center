@@ -19,6 +19,8 @@ import sys
 
 from loguru import logger
 
+STRICT_STORAGE_KEY = 'startup.strict.storage'
+
 _LIKELY_CAUSES = {
     'postgresql': [
         "server not running / wrong host or port",
@@ -92,6 +94,56 @@ def format_storage_error(mode: str, conf: dict, exc: Exception) -> str:
     )
 
 
+def warn_vector_only_mode() -> None:
+    """Say out loud that ``use_vectordb=true`` has no authoritative record store.
+
+    In that mode ``RegistryCore`` never builds a ``storage`` backend, so the
+    registry's own API cannot answer approval, ownership or tag questions; the
+    vector database is a search index, not a record store. Those entry points now
+    report 503 (`AuthoritativeStoreUnavailable`) instead of returning empty
+    results, and this pre-check reports the mode itself:
+
+    * always, when approval or owner isolation is enabled on top of it;
+    * as a hard failure when ``startup.strict.storage=true`` is set, so a
+      deployment cannot serve traffic it will refuse to answer.
+    """
+    from agent_registry.config import USE_VECTORDB, get_conf
+
+    if not USE_VECTORDB:
+        return
+    server_config = get_conf() or {}
+    impacts = []
+    if str(server_config.get('agent_approval_enabled', 'false')).lower() == 'true':
+        impacts.append('agent_approval_enabled=true stores no status to approve on')
+    if str(server_config.get('owner.isolation.enabled', 'false')).lower() == 'true':
+        impacts.append('owner.isolation.enabled=true cannot read a stored owner back')
+    if str(server_config.get(STRICT_STORAGE_KEY, 'false')).lower() == 'true':
+        logger.error(
+            "\n" + "=" * 80 + "\n"
+            "[storage pre-check] FAILED: use_vectordb=true and "
+            f"{STRICT_STORAGE_KEY}=true.\n"
+            "  A vector collection cannot answer the registry API: approval status,\n"
+            "  ownership, tags and change-feed announcements all need the\n"
+            "  authoritative record store, and the endpoints that need it now\n"
+            "  return 503 instead of an empty result.\n"
+            + ("".join(f"  - {impact}\n" for impact in impacts))
+            + "  Set use_vectordb=false (recommended) or, for an experimental\n"
+              f"  deployment that accepts the 503s, set {STRICT_STORAGE_KEY}=false.\n"
+              "  Exiting before the service port is bound.\n"
+            + "=" * 80
+        )
+        sys.exit(1)
+    if not impacts:
+        return
+    logger.warning(
+        "[storage] use_vectordb=true replaces the authoritative record store, but "
+        + "; ".join(impacts)
+        + ". Status/owner/tag endpoints return 503 in this mode. Keep "
+          "use_vectordb=false for deployments that need approval or ownership "
+          f"parity, or set {STRICT_STORAGE_KEY}=true to refuse to start."
+    )
+
+
 def verify_storage_ready() -> None:
     """Initialize the storage backend and verify connectivity; exit(1) on failure.
 
@@ -99,7 +151,25 @@ def verify_storage_ready() -> None:
     so the later FastAPI startup event becomes a cheap no-op.
     """
     from agent_registry.config import PERSISTENCE_CONF, PERSISTENCE_MODE, USE_VECTORDB
+    from agent_registry.core import validate_persistence_mode
     from agent_registry.registry_instance import get_registry
+
+    warn_vector_only_mode()
+
+    try:
+        validate_persistence_mode(PERSISTENCE_MODE)
+    except ValueError as exc:
+        logger.error(
+            "\n" + "=" * 80 + "\n"
+            "[storage pre-check] FAILED: invalid persistence.mode.\n"
+            f"  mode    : {PERSISTENCE_MODE!r}\n"
+            f"  error   : {exc}\n"
+            "  Fix persistence.mode in etc/conf/persistence.conf, then restart.\n"
+            "  Exiting before the service port is bound.\n"
+            + "=" * 80
+        )
+        sys.exit(1)
+
     try:
         registry = get_registry()
         if registry is not None and registry.storage is not None:

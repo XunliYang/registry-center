@@ -28,7 +28,7 @@ def _get_instance(capability: str) -> GenericLLM:
         if config is None:
             raise ValueError(
                 f"No model configured for capability '{capability}' "
-                f"in llm_config.json"
+                "(check etc/config/models.yaml or LLM_CONFIG_FILE)"
             )
         _instances[capability] = GenericLLM(dataclasses.asdict(config))
     return _instances[capability]

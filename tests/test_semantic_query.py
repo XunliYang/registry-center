@@ -24,12 +24,26 @@ from fastapi.testclient import TestClient
 from google.protobuf.json_format import Parse
 
 from a2a.types import AgentCard
-from agent_registry.server import app
+from agent_registry.server import app, get_registry
 
 
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def published_registry_override():
+    """The endpoint enforces the discovery policy through the injected registry.
+
+    Cards are published unless a test overrides get_status, so the retrieval
+    mock below stays the only thing deciding which cards come back.
+    """
+    registry = MagicMock()
+    registry.get_status.return_value = "published"
+    app.dependency_overrides[get_registry] = lambda: registry
+    yield registry
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -107,7 +121,8 @@ class TestSemanticQuery:
             )
             assert response.status_code == 200
 
-    def test_handles_empty_task(self, client):
+    @pytest.mark.parametrize('task', ['', '   ', True, 12, {}, [], 'x' * 10001])
+    def test_rejects_invalid_task_without_query(self, client, task):
         with patch(
             'agent_registry.registry_instance._registry_instance',
             create=True
@@ -116,10 +131,10 @@ class TestSemanticQuery:
 
             response = client.post(
                 "/rest/v1/registry-center/agent-cards/semantic-query",
-                json={"task": ""}
+                json={"task": task}
             )
-            assert response.status_code == 200
-            assert response.json() == {"agentCards": []}
+            assert response.status_code == 422
+            mock_registry.retrieve_by_task.assert_not_called()
 
     def test_internal_error_returns_500(self, client):
         with patch(
@@ -134,7 +149,7 @@ class TestSemanticQuery:
             )
             assert response.status_code == 500
 
-    def test_missing_task_field_returns_200(self, client):
+    def test_missing_task_field_returns_422_without_query(self, client):
         with patch(
             'agent_registry.registry_instance._registry_instance',
             create=True
@@ -145,4 +160,17 @@ class TestSemanticQuery:
                 "/rest/v1/registry-center/agent-cards/semantic-query",
                 json={}
             )
-            assert response.status_code == 200
+            assert response.status_code == 422
+            mock_registry.retrieve_by_task.assert_not_called()
+
+    @pytest.mark.parametrize("body", [b"", b"{not json", b"[]", b"null"])
+    def test_malformed_request_body_returns_422(self, client, body):
+        """An unparseable or non-object body is client input, never a 500."""
+        response = client.post(
+            "/rest/v1/registry-center/agent-cards/semantic-query",
+            content=body,
+            headers={"content-type": "application/json"}
+        )
+        assert response.status_code == 422
+        message = response.json()["errors"]["error"][0]["errorMessage"]
+        assert "JSON object" in message

@@ -26,6 +26,7 @@ import uvicorn
 from loguru import logger
 from uvicorn import config
 
+from agent_registry.agent_to_graph.watcher import start_watching
 from agent_registry.config import CONN_TIMEOUT, TLS_CIPHER, FORWARDED_ALLOW_IPS, IS_WINDOWS
 from agent_registry.cipher_converter import CipherConverter
 from agent_registry.internal.registry_center_internal_service import RegistryCenterInternalService
@@ -33,6 +34,12 @@ from agent_registry.internal.tcp_internal_service import TCPInternalService
 from agent_registry.persistence.precheck import verify_storage_ready
 from agent_registry.server import app
 from agent_registry.integration.listener import start_integration_access, stop_integration_access
+from agent_registry.identity import (
+    describe_identity_configuration,
+    identity_configuration_warnings,
+    install_tls_peer_cert_injection,
+    strict_startup_failures,
+)
 from agent_registry.integration.audit_sink import start_audit_sink, stop_audit_sink
 from common.cert.cert_validater import CertValidator
 from common.custom.custom_handle import HandlerRegistry
@@ -71,6 +78,7 @@ async def record_startup_log():
 
 try:
     app.add_event_handler("startup", record_startup_log)
+    app.add_event_handler("startup", start_watching)
 except AttributeError:
     pass
 
@@ -112,13 +120,31 @@ def customized_create_ssl_context(
 config.create_ssl_context = customized_create_ssl_context
 
 
+def _forwarded_allow_ips(server_config) -> str:
+    """Return the trusted-proxy address list in the form uvicorn expects.
+
+    etc/conf/server.conf and bin/entrypoint.sh wrote the value as
+    ``forwarded_allow_ips="127.0.0.1"``. The config reader only strips
+    whitespace, and uvicorn compares each entry literally, so the quotes turned
+    the whole setting into a silent no-op (no proxy was ever trusted). Strip the
+    quotes here so existing deployments keep working without editing their conf;
+    an empty list means "trust no proxy", which is the fail-closed default.
+    """
+    raw = str((server_config or {}).get(FORWARDED_ALLOW_IPS, '') or '')
+    return ','.join(
+        normalized for normalized in
+        (part.strip().strip('"').strip("'") for part in raw.split(','))
+        if normalized
+    )
+
+
 class CustomUvicornServer:
     def __init__(self, server_config, conf_obj):
         self.server_config = server_config
         self.conf_obj = conf_obj
 
     def run(self):
-        os.environ.setdefault("FORWARDED_ALLOW_IPS", self.server_config.get(FORWARDED_ALLOW_IPS))
+        os.environ.setdefault("FORWARDED_ALLOW_IPS", _forwarded_allow_ips(self.server_config))
         server_config = uvicorn.Config(
             app=app,
             host=self.server_config.get("ip", "127.0.0.1"),
@@ -129,7 +155,8 @@ class CustomUvicornServer:
             ssl_ca_certs=self.conf_obj.ssl_ca_certs,
             ssl_cert_reqs=self.conf_obj.verify_client,
             ssl_ciphers=CipherConverter.convert(self.server_config.get(TLS_CIPHER)),
-            timeout_keep_alive=0,
+            # Use Uvicorn's finite HTTP idle timeout. Zero races pooled clients;
+            # this timer starts after a response completes, not during SSE.
             timeout_graceful_shutdown=int(self.server_config.get(CONN_TIMEOUT, 30)),
             log_level="info",
             proxy_headers=True
@@ -188,6 +215,32 @@ def main():
         )
 
     server_config = get_conf()
+
+    # Caller identities (and therefore AgentCard owners) come from the verified
+    # TLS peer certificate or from a configured trusted proxy. Install the peer
+    # certificate injection before any port is bound; warn when owner isolation
+    # is enabled without a usable identity source (writes then fail closed).
+    install_tls_peer_cert_injection()
+    logger.info(describe_identity_configuration(server_config))
+    for warning in identity_configuration_warnings(server_config):
+        logger.warning(warning)
+
+    # startup.strict.identity=true turns those warnings into a hard failure, so a
+    # deployment never serves traffic while every ownership write would be 401.
+    strict_failures = strict_startup_failures(server_config)
+    if strict_failures:
+        logger.error(
+            "\n" + "=" * 80 + "\n"
+            "[startup pre-check] FAILED: startup.strict.identity=true and the owner "
+            "identity configuration cannot verify callers.\n"
+            + "".join(f"  - {problem}\n" for problem in strict_failures)
+            + "  Fix etc/conf/server.conf (enable_https/verify_client, owner.identity.mode,\n"
+              "  owner.trusted.proxy.ips) or set startup.strict.identity=false for a\n"
+              "  development deployment.\n"
+              "  Exiting before the service port is bound.\n"
+            + "=" * 80
+        )
+        sys.exit(1)
 
     # Fail fast on unusable storage (wrong DB config / unreachable DB) before
     # binding any port — including the internal UDS/TCP service below.

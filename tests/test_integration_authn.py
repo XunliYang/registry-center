@@ -131,11 +131,12 @@ async def test_jwt_provider_builds_principal_only_from_verified_claims(monkeypat
     mapper = ScopeRoleMapper({'registry.read': 'partner_service'})
     provider = JwtBearerProvider('https://issuer.example', 'registry-center',
                                  'https://issuer.example/jwks', ['RS256'], mapper)
-    monkeypatch.setattr(provider, '_decode', lambda token: {
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(provider, '_decode', AsyncMock(return_value={
         'sub': 'partner', 'client_id': 'partner-client',
         'scope': 'registry.read', 'iss': 'https://issuer.example',
         'aud': 'registry-center', 'exp': int(time.time()) + 60,
-    })
+    }))
     p = await provider.authenticate(Credential('bearer', 'jwt'), AuthenticationContext('ip'))
     assert p.auth_method == AUTH_METHOD_OAUTH2_JWT
     assert p.role == CallerRole.PARTNER_SERVICE
@@ -158,7 +159,7 @@ async def test_introspection_is_fail_closed_and_cached():
     provider = IntrospectionBearerProvider(
         'https://issuer.example/introspect', 'client', 'secret',
         'https://issuer.example', 'registry-center',
-        ScopeRoleMapper({'registry.audit': 'analytics_tool'}), client=client)
+        ScopeRoleMapper({'registry.audit': 'analytics_tool'}), client=client, cache_seconds=30)
     credential = Credential('bearer', 'opaque', fingerprint='fingerprint')
     p = await provider.authenticate(credential, AuthenticationContext('ip'))
     assert p.auth_method == AUTH_METHOD_OAUTH2_INTROSPECTION

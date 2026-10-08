@@ -18,11 +18,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from loguru import logger
-
-from common.llm.config.config_reader import read_config_as_json
-
-
 @dataclass
 class ModelConfig:
     description: str = ""
@@ -30,6 +25,8 @@ class ModelConfig:
     url: str = ""
     api_key: str = ""
     enable_thinking: bool = False
+    verify_ssl: bool = True
+    timeout: float = 60.0
     auth: Any = None
     headers: Dict[str, str] = field(default_factory=dict)
     body: Dict[str, Any] = field(default_factory=dict)
@@ -43,6 +40,8 @@ class ModelConfig:
             url=raw.get("url", ""),
             api_key=raw.get("api_key", ""),
             enable_thinking=raw.get("enable_thinking", False),
+            verify_ssl=raw.get("verify_ssl", True),
+            timeout=float(raw.get("timeout", 60.0)),
             auth=raw.get("auth"),
             headers=raw.get("headers", {}),
             body=raw.get("body", {}),
@@ -50,21 +49,21 @@ class ModelConfig:
         )
 
 
-def _load_raw_config() -> Dict[str, Dict[str, Any]]:
-    return read_config_as_json("../../config/llm_config.json")
+class _ModelConfigHolder:
+    _instance: Optional[Dict[str, ModelConfig]] = None
 
+    @classmethod
+    def get(cls) -> Dict[str, ModelConfig]:
+        if cls._instance is None:
+            from common.llm.config.model_sources import load_model_configs
+            raw_config = load_model_configs()
+            cls._instance = {key: ModelConfig.from_dict(key, val) for key, val in raw_config.items()}
+        return cls._instance
 
-try:
-    _raw_config = _load_raw_config()
-except Exception as e:
-    logger.error(f"Failed to load LLM config: {e}")
-    _raw_config = {}
-
-_model_configs: Dict[str, ModelConfig] = {
-    key: ModelConfig.from_dict(key, val)
-    for key, val in _raw_config.items()
-}
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
 
 
 def get_model_config(capability: str) -> Optional[ModelConfig]:
-    return _model_configs.get(capability)
+    return _ModelConfigHolder.get().get(capability)

@@ -106,7 +106,24 @@ class ApprovalHandler(BaseUDSHandler):
             ).model_dump()
         
         try:
-            registry.update_status(agent_name, organization, 'published')
+            updated = registry.update_status(agent_name, organization, 'published')
+            if not updated:
+                asyncio.run(audit_handle.handle({
+                    "operation_name": OperationName.APPROVE_AGENT,
+                    "level": LogLevel.MINOR,
+                    "result": OperationResult.FAILURE,
+                    "object_name": OperatorObject.AGENT,
+                    "details": details,
+                    "client_ip": "internal",
+                    "user_name": user_name
+                }))
+                logger.error(f"Failed to approve agent: {agent_name} ({organization}) - status update rejected")
+                return InternalResponse(
+                    success=False,
+                    error="Failed to update agent status",
+                    message=f"Agent '{agent_name}' status was not changed to published"
+                ).model_dump()
+
             asyncio.run(audit_handle.handle({
                 "operation_name": OperationName.APPROVE_AGENT,
                 "level": LogLevel.MINOR,

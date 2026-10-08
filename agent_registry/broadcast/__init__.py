@@ -65,6 +65,8 @@ class BroadcastService:
                 backoff_base=_float_conf(config, "broadcast.webhook.backoff.base", 2.0),
                 backoff_max=_float_conf(config, "broadcast.webhook.backoff.max", 300.0),
                 retention_days=_int_conf(config, "broadcast.outbox.retention.days", 7),
+                delivery_max_attempts=_int_conf(config, "broadcast.delivery.max.attempts", 5),
+                retry_interval=_float_conf(config, "broadcast.delivery.retry.interval", 60.0),
             )
             self.event_bus.attach_dispatcher(self.dispatcher)
 
@@ -108,6 +110,11 @@ def initialize_broadcast_service(backend=None, mode: Optional[str] = None) -> Br
             outbox, subscription_store = _build_stores(backend, mode)
             _service = BroadcastService(outbox, subscription_store)
             logger.info(f"Broadcast service initialized (enabled={_service.broadcast_enabled})")
+        elif backend is not None and (mode or "").strip().lower() in ("sqlite", "postgresql", "gauss", "mysql"):
+            # A prior lazy get_broadcast_service() may have installed a file
+            # outbox. Do not silently keep it for an authoritative SQL store.
+            if getattr(_service.outbox, "_backend", None) is not backend:
+                raise RuntimeError("Broadcast outbox is not bound to the authoritative SQL storage")
     return _service
 
 

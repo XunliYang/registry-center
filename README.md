@@ -49,19 +49,27 @@ The Registry Center provides unified lifecycle management for **AgentCards** —
 | Category | Capability |
 |----------|------------|
 | **AgentCard CRUD** | Register, query (by name/organization), update, and deregister agent descriptions |
-| **Semantic Search** | Natural-language task matching via LLM + optional vector DB (Milvus) |
+| **Semantic Search** | Natural-language task matching over published AgentCards via LLM; model failures return 503. Legacy Milvus mode remains experimental and does not provide SQL-backed approval/ownership parity: those endpoints answer 503 instead of empty results |
 | **Agent Approval** | Optional manual review workflow — agents start as `registered`, admins promote to `published` |
 | **Tag Management** | Independent tag entities with full CRUD, assignable to agents |
 | **TLS Security** | TLS 1.2/1.3 with strong cipher suites, mutual TLS client certificate verification |
 | **Signature Verification** | JWS-based AgentCard integrity checks (RS256, ES256), static JWK or dynamic `jku` lookup. `jku` lookup is gated by an operator-configured host allowlist (`jwk_allowlist` in `etc/conf/server.conf`, or `REGISTRY_JWK_ALLOWLIST`); with no allowlist configured the `jku` path is disabled (fail closed) and only backend keys are used |
-| **Owner Isolation** | Per-agent ownership via TLS client certificate CN, strict or relaxed mode |
+| **Owner Isolation** | Ownership from verified TLS client certificates or an explicitly trusted proxy; ownerless legacy cards require administrative ownership assignment |
 | **Content Safety** | Prompt injection and high-risk skill blacklist filtering on registration |
 | **Rate Limiting** | Per-endpoint rate limits (configurable: 50–100 req/s, JWK endpoint: 10 req/s) with moving-window algorithm |
 | **Heartbeat Detection** | Agents periodically report liveness; configurable failure threshold and grace period to identify offline agents promptly |
-| **Change Broadcast** | Registry changes pushed to subscribers via webhooks (HMAC signing, debouncing, rate limiting, outbox persistence) with version-based reconciliation |
+| **Change Broadcast** | Best-effort webhooks to operator-allowlisted destinations, with HMAC signing and version-based reconciliation; version allocation is commit-ordered in the SQL persistence modes (deployment stays single-instance) and delivery state is tracked per subscriber, while retry-after-failure and exactly-once semantics are not yet guaranteed |
 | **Audit Logging** | Rotating JSON audit log (time, client IP, user, operation, object, result) |
 | **CLI Administration** | Interactive CLI for agent approval, tag management, and full agent listing |
 | **Custom Extensions** | Pluggable handlers (auth, audit, decrypt, storage) and LLM providers |
+
+See [upgrade and deployment notes](docs/en/Registry%20Center%20Upgrade%20Notes.md)
+([中文](docs/zh/注册中心升级与部署说明.md)) for identity configuration, approval
+visibility, legacy-event synchronization, and container probe setup. The generic
+knowledge-graph API is pre-embedded and disabled by default; enabling it requires
+an authenticated operator and separate graph permissions. `docker-compose.yml`
+is a loopback-only development example with client authentication disabled;
+it is not a production access-policy template.
 
 ## Quick Start
 
@@ -97,6 +105,9 @@ The service starts on `https://127.0.0.1:5000` by default (HTTPS). For a quick t
 python -m agent_registry.init    # choose: enable_https = false
 python -m agent_registry.start   # starts on http://127.0.0.1:5000
 ```
+
+For Docker/Podman packaging, runtime secret mounts, port precedence and
+non-interactive initialization, see [Container deployment](docs/container-deployment.md).
 
 ### Register Your First Agent
 
@@ -194,11 +205,33 @@ See the [API Reference](docs/en/Registry%20Center%20API%20Reference.md) for full
 
 | Config File | Purpose |
 |-------------|---------|
-| `etc/conf/server.conf` | Server IP, port, TLS certificates, signing, approval, owner isolation |
-| `etc/conf/server.properties` | TLS versions, ciphers, connection/timeout/rate limits |
+| `etc/conf/server.conf` | Feature switches and deployment/access settings: IP, port, TLS/credential references, IAM endpoints and identity modes |
+| `etc/conf/server.properties` | Operating parameters and business policies: TLS versions/ciphers, limits, heartbeat timing, notification retry and OAuth cache/scope policies |
 | `etc/conf/persistence.conf` | Storage backend: `file` (default), `postgresql` |
 | `etc/conf/log_config.conf` | Audit log rotation (size, backup count) |
-| `common/config/llm_config.json` | LLM model endpoints for semantic search (OpenAI-compatible or AOC) |
+| `.env` | Local secrets (gitignored); model definitions live in `etc/config/models.yaml` |
+
+Define each key in only one server file. Loading order remains `server.conf` →
+`server.properties` → `REGISTRY_*` environment overrides. Duplicate definitions
+produce a warning containing key names only; historical last-loaded precedence
+is preserved for existing deployments. When migrating policies from `server.conf`,
+move their **effective values**, not template defaults, into `server.properties`,
+then remove the old definitions. The initialization wizard only edits deployment
+and feature settings. The image initializes from `server.conf.example` plus the
+public `server.properties`; local deployment files and secrets are not image inputs.
+
+Model definitions live in the gitignored `etc/config/models.yaml` (copy
+[`models.yaml.example`](etc/config/models.yaml.example)), while secrets come
+from environment variables or a local gitignored `.env` (see
+[`.env.example`](.env.example)). Built-in `openai_compatible` (`openai` alias) and `aoc_signed` profiles
+provide request/response contracts, while each `models:` entry sets `model` and
+`url` and names its secret through `api_key_env` or `auth.<field>_env`. The same
+structure is used by Orchestration Center. Environment variables override
+`.env`; restart the process after changing either source. A new model using an
+existing protocol needs only configuration; a new protocol registers a profile
+in `common/llm/config/model_sources.py` and adds tests.
+Existing installations can run `python -m scripts.migrate_llm_config` once;
+the application no longer reads or tracks the old JSON.
 
 Configure interactively:
 
@@ -215,7 +248,7 @@ python -m agent_registry.init
 | [API Reference](docs/en/Registry%20Center%20API%20Reference.md) | Full REST API specification with request/response examples |
 | [Security Guide](docs/en/Registry%20Center%20Security%20Guide.md) | TLS, access control, audit logging, content safety, certificate tooling |
 | [GCP Containerized Deployment Guide](docs/en/Registry%20Center%20GCP%20Containerized%20Deployment%20Guide.md) | Containerized deployment of Registry Center on Google Cloud Platform |
-| [LLM Config](common/config/README_en.md) | LLM configuration file reference |
+| [LLM Config](etc/config/README_en.md) | LLM configuration file reference |
 
 > For Chinese documentation, see [中文 README](README_zh.md) or [docs/zh/](docs/zh/).
 

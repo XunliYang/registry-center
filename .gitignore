@@ -7,6 +7,8 @@ log/
 data/
 DEPLOY_ALIYUN_zh.md
 .env
+common/config/llm_config.json
+common/config/models.yaml
 *.pem
 *.cer
 *.key
@@ -15,3 +17,10 @@ etc/sign_cert/
 
 # Config-secret cipher key (auto-generated, per-machine)
 **/cipher.key
+
+# Local review working notes (cross-review loop artifacts)
+reviews/
+.claude
+
+# Local model config (credential-free; secrets come from env vars)
+etc/config/models.yaml

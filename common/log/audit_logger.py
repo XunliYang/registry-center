@@ -54,6 +54,7 @@ class OperationName:
     LIST_TAGS = "List Tags"
     GENERATE_CERTIFICATE = "Generate Certificate"
     AUTH_BAN = "Authentication Ban"
+    ACQUIRE_TOKEN = "Acquire Access Token"
     CREATE_SUBSCRIPTION = "Create Subscription"
     DELETE_SUBSCRIPTION = "Delete Subscription"
     PULL_AUDIT_RECORDS = "Pull Audit Records"

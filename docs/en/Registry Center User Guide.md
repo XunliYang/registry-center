@@ -251,7 +251,8 @@ agent-registry>
 | ssl_keyfile | Service private key path | etc/ssl/server_key.pem |
 | signature_validation_enabled | Signature verification switch | true |
 | agent_approval_enabled | Approval switch | false |
-| use_vectordb | Enable vector database | false |
+| use_vectordb | Enable vector database (replaces the authoritative store; approval/ownership/tag endpoints and status-announcing mutations then return 503 instead of empty results) | false |
+| startup.strict.storage | Refuse to start when use_vectordb=true leaves the registry without an authoritative record store | false |
 
 ### Persistence Configuration (etc/conf/persistence.conf)
 
@@ -263,45 +264,61 @@ agent-registry>
 | gauss.* | GaussDB connection: host/port/database/username/password/pool.min/pool.max/connect_timeout | localhost:5432 |
 | mysql.* | MySQL connection: host/port/name/username/password/pool.min/pool.max/connect_timeout | localhost:3306 |
 
-### Advanced Configuration (etc/conf/server.properties)
+### Operating Parameters and Business Policies (etc/conf/server.properties)
 
 | Configuration Item | Description | Default |
 |--------------------|-------------|---------|
 | agent.num.max | Maximum number of Agents | 100 |
-| connection.max | Maximum connections | 500 |
+| connection.max | Maximum active HTTP responses, including the complete SSE lifetime; not an OS TCP socket count | 500 |
 | connection.timeout | Timeout (seconds) | 300 |
 
-### Heartbeat Detection Configuration (etc/conf/server.conf)
+### Heartbeat Detection Configuration
 
 Agents periodically report liveness, and the Registry Center determines health status based on the failure threshold. All settings can be overridden with `REGISTRY_`-prefixed environment variables (for example, `REGISTRY_HEARTBEAT_INTERVAL`).
 
-| Configuration Item | Description | Default |
-|--------|------|--------|
-| heartbeat.enabled | Heartbeat detection master switch; when off, behavior matches legacy versions | false |
-| heartbeat.interval | Expected heartbeat period (seconds), advertised to Agents in the heartbeat response | 30 |
-| heartbeat.failure.threshold | Consecutive missed periods before an Agent is marked offline | 3 |
-| heartbeat.grace.period | Suspect-state buffer duration (seconds) | 10 |
-| heartbeat.sweep.interval | Background sweep period (seconds) | 10 |
-| heartbeat.offline.ttl | Auto-deregister Agents offline longer than this (0 = disabled) | 0 |
-| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from query results | false |
-| flowcontrol.ratelimit.heartbeat | Heartbeat API rate limit (requests/second/IP) | 100 |
+| Configuration Item | Description | Default | File |
+|--------|------|--------|------|
+| heartbeat.enabled | Heartbeat detection master switch; when off, behavior matches legacy versions | false | `server.conf` |
+| heartbeat.interval | Expected heartbeat period (seconds), advertised to Agents in the heartbeat response | 30 | `server.properties` |
+| heartbeat.failure.threshold | Consecutive missed periods before an Agent is marked offline | 3 | `server.properties` |
+| heartbeat.grace.period | Suspect-state buffer duration (seconds) | 10 | `server.properties` |
+| heartbeat.sweep.interval | Background sweep period (seconds) | 10 | `server.properties` |
+| heartbeat.offline.ttl | Auto-deregister Agents offline longer than this (0 = disabled) | 0 | `server.properties` |
+| heartbeat.hide.unhealthy.results | Whether suspect/offline Agents are hidden from **task-discovery** query results (the health list/history/SSE always show them, so offline alerts stay visible) | false | `server.conf` |
+| flowcontrol.ratelimit.heartbeat | Heartbeat API rate limit (requests/second/IP) | 100 | `server.properties` |
 
-### Change Broadcast Configuration (etc/conf/server.conf)
+### Change Broadcast Configuration
 
 Registry changes (registration/update/deregistration/health changes) are pushed to subscribers via webhooks. Events are persisted before dispatch, so a Registry Center restart never loses them; subscribers can catch up by version through the change reconciliation API.
 
-| Configuration Item | Description | Default |
-|--------|------|--------|
-| broadcast.enabled | Broadcast master switch | false |
-| broadcast.debounce.window | Debounce window (seconds); repeated changes of one Agent are coalesced | 2 |
-| broadcast.max.events.per.second | Per-subscription delivery rate limit (overflow degrades to a summary event) | 50 |
-| broadcast.webhook.timeout | Delivery timeout (seconds) | 10 |
-| broadcast.webhook.max.retries | Maximum retries (exponential backoff) | 5 |
-| broadcast.webhook.backoff.base | Backoff base (seconds) | 2 |
-| broadcast.webhook.backoff.max | Backoff cap (seconds) | 300 |
-| broadcast.outbox.retention.days | Event retention days | 7 |
-| broadcast.allow.http.callbacks | Whether HTTP callbacks are allowed (development only) | false |
-| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names) | empty |
+| Configuration Item | Description | Default | File |
+|--------|------|--------|------|
+| broadcast.enabled | Broadcast master switch | false | `server.conf` |
+| broadcast.debounce.window | Batch window (seconds); retains each durable event ID in version order | 2 | `server.properties` |
+| broadcast.max.events.per.second | Per-subscription delivery rate limit (overflow degrades to a summary event) | 50 | `server.properties` |
+| broadcast.webhook.timeout | Delivery timeout (seconds) | 10 | `server.properties` |
+| broadcast.webhook.max.retries | Maximum retries (exponential backoff) | 5 | `server.properties` |
+| broadcast.webhook.backoff.base | Backoff base (seconds) | 2 | `server.properties` |
+| broadcast.webhook.backoff.max | Backoff cap (seconds) | 300 | `server.properties` |
+| broadcast.delivery.max.attempts | Attempt budget for durable retry of failed deliveries; once spent, the delivery stays failed in the internal ledger (`/changes` returns event content for reconciliation, not delivery status) | 5 | `server.properties` |
+| broadcast.delivery.retry.interval | Seconds between durable retry sweeps (also swept once at startup) | 60 | `server.properties` |
+| broadcast.outbox.retention.days | Event retention days | 7 | `server.properties` |
+| broadcast.allow.http.callbacks | Whether HTTP callbacks are allowed (development only) | false | `server.conf` |
+| broadcast.callback.allowlist | Callback host allowlist (comma-separated domain names); mandatory before subscriptions can be created | empty (fails closed) | `server.conf` |
+
+The in-process wake-up queue holds at most 1,024 hints; the dispatcher caches
+at most 1,024 subscriber/event pairs. Each subscriber has one queued batch and
+one active batch (at most 256 events per batch). Overflow remains in the outbox
+and is recovered in pages; these are implementation bounds, not new
+configuration keys. They do not bound the durable backlog or the total memory
+of file/memory stores, which keep retained events resident. Monitor backlog
+and disk capacity; a slow destination is not made fast by bounded queues.
+
+The default semantic-query handler offloads synchronous model/vector I/O with
+at most eight active queries per listener event loop. Cancelling the HTTP
+await does not cancel a running synchronous request: it retains its slot until
+completion or the model adapter's HTTP timeout. Configure that timeout
+appropriately; a request timeout does not mean the remote model stopped work.
 
 ## Error Code Quick Reference
 
@@ -359,3 +376,18 @@ signature_validation_enabled=false
 ### Q5: Can it run in a Windows environment?
 
 Yes. The Registry Center supports Windows environments for development and debugging. The unified entry point is: `python -m agent_registry.start`. On Windows, the built-in service uses the TCP protocol (127.0.0.1:1108).
+
+### Q6: Semantic matching / intelligent filtering always returns an empty list — how do I debug it?
+
+**Symptom**: Semantic search returns no candidates, or reports 503 when the model is unavailable.
+
+**Cause**: The feature depends on the `chat` capability in `etc/config/models.yaml`. Missing configuration, model failure, or invalid output now returns 503. A 200 empty result means no published candidate matched (or no published candidates were available), rather than a hidden model error. Pending Agents are not sent to the selection model.
+
+**Steps**:
+
+1. Confirm `etc/config/models.yaml` exists (copy `etc/config/models.yaml.example` to start) and has a `chat` entry under `models:`; `model` and `url` are required
+2. Confirm the environment variable each entry names through `api_key_env` is set in the process environment or the repository-root `.env` (never write secrets into the model file)
+3. Look for `No model configured for capability 'chat'` in the backend log
+4. Restart the service after changes — model clients are cached per process
+
+See [Development Guide Appendix 4](Registry%20Center%20Development%20Guide.md) and [`models.yaml.example`](../../etc/config/models.yaml.example) for the fields and protocols, and [Configure the Model File](Registry%20Center%20GCP%20Containerized%20Deployment%20Guide.md) for container deployments.

@@ -72,7 +72,7 @@ class PostgreSQLQueries(str, Enum):
     """
 
     FIND_BY_STATUS = """
-        SELECT agent_card_json FROM agent_card WHERE status = %s
+        SELECT agent_card_json FROM agent_card WHERE COALESCE(status, 'published') = %s
     """
 
     FIND_ALL = "SELECT agent_card_json FROM agent_card"
@@ -98,7 +98,7 @@ class PostgreSQLQueries(str, Enum):
 
     COUNT = "SELECT COUNT(*) FROM agent_card"
 
-    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE status = %s"
+    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE COALESCE(status, 'published') = %s"
 
     GET_CREATED_AT = """
         SELECT created_at FROM agent_card
@@ -321,7 +321,7 @@ class SQLiteQueries(str, Enum):
     """
 
     FIND_BY_STATUS = """
-        SELECT agent_card_json FROM agent_card WHERE status = ?
+        SELECT agent_card_json FROM agent_card WHERE COALESCE(status, 'published') = ?
     """
 
     FIND_BY_TAG = """
@@ -371,7 +371,7 @@ class SQLiteQueries(str, Enum):
 
     COUNT = "SELECT COUNT(*) FROM agent_card"
 
-    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE status = ?"
+    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE COALESCE(status, 'published') = ?"
 
     GET_CREATED_AT = """
         SELECT created_at FROM agent_card
@@ -556,7 +556,7 @@ class GaussDBQueries(str, Enum):
     """
 
     FIND_BY_STATUS = """
-        SELECT agent_card_json FROM agent_card WHERE status = %s
+        SELECT agent_card_json FROM agent_card WHERE COALESCE(status, 'published') = %s
     """
 
     FIND_BY_TAG = """
@@ -606,7 +606,7 @@ class GaussDBQueries(str, Enum):
 
     COUNT = "SELECT COUNT(*) FROM agent_card"
 
-    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE status = %s"
+    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE COALESCE(status, 'published') = %s"
 
     GET_CREATED_AT = """
         SELECT created_at FROM agent_card
@@ -751,7 +751,7 @@ class MySQLQueries(str, Enum):
     """
 
     FIND_BY_STATUS = """
-        SELECT agent_card_json FROM agent_card WHERE status = %s
+        SELECT agent_card_json FROM agent_card WHERE COALESCE(status, 'published') = %s
     """
 
     FIND_BY_TAG = """
@@ -806,7 +806,7 @@ class MySQLQueries(str, Enum):
 
     COUNT = "SELECT COUNT(*) FROM agent_card"
 
-    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE status = %s"
+    COUNT_BY_STATUS = "SELECT COUNT(*) FROM agent_card WHERE COALESCE(status, 'published') = %s"
 
     GET_CREATED_AT = """
         SELECT created_at FROM agent_card

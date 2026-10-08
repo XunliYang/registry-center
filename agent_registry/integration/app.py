@@ -32,7 +32,9 @@ main endpoints via the extracted _process_* helpers in server.py.
 """
 
 from typing import Any, List, Optional
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -43,11 +45,12 @@ from loguru import logger
 from agent_registry.broadcast import get_broadcast_service
 from agent_registry.broadcast.subscriptions import Subscription
 from agent_registry.core import RegistryCore
+from agent_registry.errors import AuthoritativeStoreUnavailable, RegistryUnavailableError
 from agent_registry.server import (
     CustomHTTPException,
     get_registry_signer,
     get_signature_validator,
-    _is_hidden_unhealthy,
+    _is_discoverable,
     _process_register_cards,
     _process_update_cards,
     _normalize_agent_cards,
@@ -55,6 +58,7 @@ from agent_registry.server import (
     _registration_record_to_dict,
     _published_healthy_records,
     _validate_callback_url,
+    _parse_json_object,
 )
 from agent_registry.server import (
     deregister_semaphore,
@@ -69,6 +73,7 @@ from agent_registry.agent_registry.agent_card_signer import AgentCardSigner
 from agent_registry.model.agent_layer import normalize_layer
 from agent_registry.persistence.milvus_layer_migration import LayerMigrationRequiredError
 import agent_registry.integration.authn  # noqa: F401 - registers the built-in authn handler
+from agent_registry.request_validation import card_batch, semantic_query as validate_semantic_query
 from common.custom.custom_handle import HandlerRegistry
 from common.custom.interface_type import InterfaceType
 from common.log.audit_logger import (
@@ -83,17 +88,50 @@ from common.util.authenticate_util import (
     AuthenticationError,
     AuthorizationError,
     CallerRole,
+    CallerType,
     Principal,
 )
 from agent_registry.integration.audit import audit_integration, audit_integration_failure
 from agent_registry.integration.audit_query import read_audit_records
 from agent_registry.integration.ban import BanTracker
+from agent_registry.integration.token_acquisition import (
+    TokenAcquisitionError, close_token_acquisition, get_token_acquisition,
+    parse_token_request,
+)
 from limits import parse as parse_rate_limit, storage as limit_storage, strategies as limit_strategies
 
 # ---------- Application ----------
+@asynccontextmanager
+async def integration_lifespan(app: FastAPI):
+    handler = HandlerRegistry._instances.get(InterfaceType.INTEGRATION_AUTHENTICATE.value)
+    service = get_token_acquisition() if handler is not None else None
+    try:
+        yield
+    finally:
+        await close_integration_resources(expected_handler=handler, expected_service=service)
+
+
+async def close_integration_resources(expected_handler=None, expected_service=None):
+    """Idempotent cleanup, also used when startup fails before ASGI lifespan."""
+    try:
+        key = InterfaceType.INTEGRATION_AUTHENTICATE.value
+        current = HandlerRegistry._instances.get(key)
+        handler = None
+        if expected_handler is None or current is expected_handler:
+            handler = HandlerRegistry._instances.pop(key, None)
+        if handler is not None and hasattr(handler, 'aclose'):
+            await handler.aclose()
+    finally:
+        if expected_handler is None:
+            await close_token_acquisition()
+        else:
+            await close_token_acquisition(expected_service=expected_service)
+
+
 # Interactive API docs are disabled on the integration surface.
 integration_app = FastAPI(title="Registry Center Integration Access",
-                          docs_url=None, redoc_url=None, openapi_url=None)
+                          docs_url=None, redoc_url=None, openapi_url=None,
+                          lifespan=integration_lifespan)
 
 # ---------- Auth failure ban + per-credential rate limiting (lazy singletons) ----------
 
@@ -228,18 +266,29 @@ async def integration_auth(request: Request) -> Principal:
              "bannedKey": banned_key.split(':', 1)[0],
              "retryInSeconds": tracker.remaining_seconds(banned_key)})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Temporarily banned due to repeated failures")
+                            detail="Temporarily banned due to repeated failures",
+                            headers={'WWW-Authenticate': 'Bearer error="invalid_token"'})
 
     # 2. Credential authentication (token headers first, then TLS peer cert)
     try:
         principal = await handler.handle(client_ip, request)
         if not isinstance(principal, Principal):
             # A misbehaving custom handler returned None/non-Principal:
-            # treat as authentication failure, never leak a 500.
-            raise AuthenticationError(AuthFailureReason.INVALID_CREDENTIALS,
+            # A provider contract defect is not evidence of bad caller credentials.
+            raise AuthenticationError(AuthFailureReason.PROVIDER_UNAVAILABLE,
                                       "Authentication failed")
     except Exception as e:
         reason = getattr(e, 'reason', None)
+        invalid_credentials = {
+            AuthFailureReason.INVALID_CREDENTIALS, AuthFailureReason.MISSING_CREDENTIALS,
+            AuthFailureReason.INVALID_CERTIFICATE, AuthFailureReason.INVALID_TOKEN,
+            AuthFailureReason.INVALID_TOKEN_FORMAT,
+        }
+        if not isinstance(e, AuthenticationError) or reason not in invalid_credentials:
+            await audit_integration_failure(op_name, Principal(client_ip=client_ip),
+                                            {"message": "authentication provider unavailable"})
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="Authentication provider unavailable") from None
         just_banned = False
         for key in _failure_ban_keys(credential_hint, client_ip):
             if tracker.record_failure(key):
@@ -253,10 +302,13 @@ async def integration_auth(request: Request) -> Principal:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Temporarily banned due to repeated failures" if just_banned
-            else (e.detail if isinstance(e, AuthenticationError) else 'Authentication failed')) from e
+            else 'Authentication failed',
+            headers={'WWW-Authenticate': 'Bearer error="invalid_token"'}) from None
 
     tracker.record_success(_success_ban_key(principal, client_ip))
     tracker.record_success(f"ip:{client_ip}")
+    if credential_hint:
+        tracker.record_success(f"token:{credential_hint}")
 
     # 3. Per-credential rate limit (task 5.2)
     if not _tp_limiter.hit(get_tp_rate(), 'integration', principal.credential_id):
@@ -291,7 +343,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     content = {"errors": {"error": [{"errorMessage": exc.detail}]}}
     if getattr(exc, "extra", None):
         content.update(exc.extra)
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
 
 @integration_app.exception_handler(RequestValidationError)
@@ -306,10 +358,72 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
     )
 
 
+@integration_app.exception_handler(RegistryUnavailableError)
+async def registry_unavailable_handler(request: Request, exc: RegistryUnavailableError):
+    """Same 503 contract as the main port (R4/R12: no record store, no model)."""
+    logger.warning(f"Rejecting {request.url.path}: {exc}")
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={"errors": {"error": [{"errorMessage": str(exc)}]}})
+
+
 @integration_app.exception_handler(AuthorizationError)
 async def authorization_exception_handler(request: Request, exc: AuthorizationError):
     return JSONResponse(status_code=status.HTTP_403_FORBIDDEN,
-                        content={"errors": {"error": [{"errorMessage": exc.detail}]}})
+                        content={"errors": {"error": [{"errorMessage": exc.detail}]}},
+                        headers={'WWW-Authenticate': 'Bearer error="insufficient_scope"'})
+
+
+# ---------- Optional OAuth token acquisition (not a Bearer-protected resource) ----------
+
+@integration_app.post('/integration/v1/oauth2/token', summary='Acquire an IAM access token')
+async def acquire_access_token(request: Request):
+    headers = {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
+    service = get_token_acquisition()
+    if service is None:
+        return JSONResponse(status_code=404, content={'error': 'not_found'}, headers=headers)
+    client_ip = request.client.host if request.client else ''
+    principal = Principal(client_ip=client_ip)
+    tracker = get_ban_tracker()
+    credentials = None
+    try:
+        if not _tp_prerate_limiter.hit(get_tp_prerate(), 'tp_prerate', client_ip):
+            raise TokenAcquisitionError('temporarily_unavailable', 429)
+        if tracker.is_banned(f'ip:{client_ip}'):
+            raise TokenAcquisitionError('invalid_client', 401)
+        credentials, scope = await parse_token_request(request)
+        # Admission before IAM issuance, isolated by the complete submitted credential.
+        # Do not debit an unverified client_id's authenticated-identity budget.
+        if not _tp_limiter.hit(get_tp_rate(), 'token_acquisition_attempt',
+                               service.credential_budget_key(credentials)):
+            raise TokenAcquisitionError('temporarily_unavailable', 429)
+        # Read-only admission: an ID already exhausted by authenticated calls
+        # need not cause another issuance. Unverified IDs never debit this bucket.
+        if not _tp_limiter.test(get_tp_rate(), 'token_acquisition', credentials.client_id):
+            raise TokenAcquisitionError('temporarily_unavailable', 429)
+        token = await service.acquire(credentials, scope)
+        tracker.record_success(f'ip:{client_ip}')
+        # Identity is trusted only AFTER IAM authenticates the caller's credentials.
+        principal = Principal(client_ip=client_ip, identity=credentials.client_id,
+                              subject=credentials.client_id, client_id=credentials.client_id,
+                              caller_type=CallerType.INTEGRATION)
+        if not _tp_limiter.hit(get_tp_rate(), 'token_acquisition', credentials.client_id):
+            raise TokenAcquisitionError('temporarily_unavailable', 429)
+        await audit_integration(OperationName.ACQUIRE_TOKEN, principal, True,
+                                {'message': 'access token acquired from IAM'})
+        return JSONResponse(content=token.response(), headers=headers)
+    except TokenAcquisitionError as exc:
+        if exc.error == 'invalid_client' and not tracker.is_banned(f'ip:{client_ip}'):
+            tracker.record_failure(f'ip:{client_ip}')
+        if exc.status_code == 401:
+            headers['WWW-Authenticate'] = 'Basic realm="registry-token"'
+        await audit_integration_failure(OperationName.ACQUIRE_TOKEN, principal,
+                                        {'message': f'token acquisition failed: {exc.error}'})
+        return JSONResponse(status_code=exc.status_code, content={'error': exc.error}, headers=headers)
+    except Exception:
+        # Never include custom adapter errors: they may carry credentials or IAM bodies.
+        await audit_integration_failure(OperationName.ACQUIRE_TOKEN, principal,
+                                        {'message': 'token acquisition provider unavailable'})
+        return JSONResponse(status_code=503, content={'error': 'temporarily_unavailable'}, headers=headers)
 
 
 def _require_broadcast_enabled() -> None:
@@ -345,7 +459,7 @@ async def register_agent(
             op_name=OperationName.REGISTER_AGENT)),
 ):
     """Register new agent cards. New cards are owned by the credential identity."""
-    body = await request.json()
+    body = await _parse_json_object(request)
     registration_items = _normalize_agent_cards(body)
     registry = get_registry_dependency()
     signature_validator = get_signature_validator()
@@ -390,10 +504,9 @@ async def list_agents(
                 raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         published_agents = []
         for agent in agents:
-            agent_status = registry.get_status(agent.name, agent.provider.organization)
-            if agent_status != 'published':
-                continue
-            if _is_hidden_unhealthy(agent.name, agent.provider.organization):
+            # Same predicate as the main port: status *and* health hiding. Keeping a
+            # second copy of the rule here is how a pending card leaks out of one port.
+            if not _is_discoverable(agent.name, agent.provider.organization, registry):
                 continue
             published_agents.append(MessageToDict(agent))
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
@@ -419,10 +532,8 @@ async def get_agent(
         record = await get_handle.handle(name, organization)
         registry = get_registry_dependency()
         result: List[dict] = []
-        if record is not None:
-            agent_status = registry.get_status(name, organization)
-            if agent_status == 'published' and not _is_hidden_unhealthy(name, organization):
-                result = [MessageToDict(record.agent_card)]
+        if record is not None and _is_discoverable(name, organization, registry):
+            result = [MessageToDict(record.agent_card)]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
                                 {"name": name, "organization": organization,
                                  "found": bool(result)})
@@ -449,7 +560,7 @@ async def update_agent(
         await audit_integration_failure(OperationName.UPDATE_AGENT, principal, details)
         raise AuthorizationError("Vendor agents may only update their own agent cards")
 
-    body = await request.json()
+    body = await _parse_json_object(request)
     registration_items = _normalize_agent_cards(body)
     owner_param = principal.identity if principal.role == CallerRole.VENDOR_AGENT else None
     return await _process_update_cards(
@@ -499,8 +610,8 @@ async def semantic_query(
             op_name=OperationName.RETRIEVE_AGENT)),
 ):
     """Find agents semantically relevant to a task description (LLM-backed)."""
-    body = await request.json()
-    task = body.get("task", '')
+    body = await _parse_json_object(request)
+    task, top_n = validate_semantic_query(body, body.get('topN', 10))
     layer = body.get("layer") if "layer" in body else None
     if layer is not None:
         try:
@@ -509,12 +620,6 @@ async def semantic_query(
             raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     elif "layer" in body:
         raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "layer cannot be null")
-    try:
-        top_n = int(body.get("topN", 10))
-    except (TypeError, ValueError):
-        raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                  "topN must be an integer")
-    top_n = max(1, min(top_n, 50))
     async with semaphore_guard(retrieve_semaphore):
         if layer is None:
             retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
@@ -529,6 +634,22 @@ async def semantic_query(
         result = [MessageToDict(a) for a in agents]
         await audit_integration(OperationName.QUERY_AGENT, principal, True,
                                  {"task": task[:200], "count": len(result), "layer": layer or ''})
+        if layer is None:
+            retrieve_handle = HandlerRegistry.get_handler(InterfaceType.RETRIEVE)
+            agents = await retrieve_handle.handle(task, top_n)
+        else:
+            registry = get_registry_dependency()
+            try:
+                agents = registry.retrieve_by_task(task, top_n, layer=layer)
+            except LayerMigrationRequiredError as exc:
+                raise CustomHTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        registry = get_registry_dependency()
+        agents = [a for a in agents
+                  if _is_discoverable(a.name, a.provider.organization, registry)
+                  and not _is_hidden_unhealthy(a.name, a.provider.organization)]
+        result = [MessageToDict(a) for a in agents]
+        await audit_integration(OperationName.QUERY_AGENT, principal, True,
+                                {"top_n": top_n, "count": len(result), "layer": layer or ''})
         return {"agentCards": result}
 
 
@@ -677,7 +798,7 @@ async def create_subscription(
     parity with the main port: broadcast gate, event-type validation,
     dispatcher wiring, caller-provided secret."""
     _require_broadcast_enabled()
-    body = await request.json()
+    body = await _parse_json_object(request)
     callback_url = body.get("callbackUrl", '')
     if not callback_url:
         raise CustomHTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -706,7 +827,7 @@ async def create_subscription(
         broadcast_service.dispatcher.add_subscription(created)
     await audit_integration(OperationName.CREATE_SUBSCRIPTION, principal, True,
                             {"subscriptionId": created.subscription_id,
-                             "callbackUrl": callback_url})
+                             "callbackHost": urlsplit(callback_url).hostname or ''})
     payload = created.to_dict(include_secret=True)
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=payload)
 

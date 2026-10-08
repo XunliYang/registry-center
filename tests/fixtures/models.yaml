@@ -1,0 +1,26 @@
+# Secret-free model definitions used by the test suite.
+#
+# Model definitions are kept out of the repository so that no credential can be
+# committed alongside them, which means a checkout has no models.yaml at the
+# default path. The RegistryCore startup path resolves the "chat" capability, so
+# the suite needs one definition to exist.
+#
+# Every URL points at the discard port and no api_key_env is referenced: a test
+# that unexpectedly reaches the network fails immediately instead of talking to a
+# real endpoint, and the file stays safe to commit.
+models:
+  chat:
+    provider: openai_compatible
+    model: test-chat
+    url: http://127.0.0.1:9/v1/chat/completions
+    timeout: 5
+  embed:
+    provider: openai_compatible
+    model: test-embed
+    url: http://127.0.0.1:9/v1/embeddings
+    timeout: 5
+  rerank:
+    provider: openai_compatible
+    model: test-rerank
+    url: http://127.0.0.1:9/v1/rerank
+    timeout: 5

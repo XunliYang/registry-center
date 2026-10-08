@@ -1,5 +1,16 @@
 #!/bin/bash
 set -e
+umask 077
+
+# Reject unsupported serve flags before touching configuration. Additional
+# commands retain the standard container pass-through behavior.
+if [ "$#" -eq 0 ]; then
+    set -- serve
+fi
+if [ "$1" = "serve" ] && [ "$#" -ne 1 ]; then
+    echo "serve accepts no arguments; configure PORT/REGISTRY_* environment variables instead" >&2
+    exit 2
+fi
 
 APP_HOME="${APP_HOME:-/opt/registry-center}"
 cd "$APP_HOME"
@@ -7,14 +18,13 @@ cd "$APP_HOME"
 export PATH="/opt/venv/bin:$PATH"
 
 # ─────────────────────────────────────────────────────────────────────
-# Cloud Run environment variable → config file override
-# The application reads from config files, not env vars.
-# This bridge writes env var values into the config files so they
-# take effect at runtime.
+# Container conventions → configuration consumed by all application loaders.
+# REGISTRY_* is also read by Python, so normalize aliases before writing files.
 # ─────────────────────────────────────────────────────────────────────
 
 SERVER_CONF="etc/conf/server.conf"
 PERSISTENCE_CONF="etc/conf/persistence.conf"
+MODELS_CONF="etc/config/models.yaml"
 
 # Escape sed metacharacters (&, backslash, delimiter #) in override values so
 # credentials or hosts containing them don't corrupt the config file.
@@ -30,6 +40,17 @@ fi
 
 # Cloud Run injects PORT env var
 if [ -n "${PORT}" ]; then
+    export REGISTRY_PORT="${PORT}"
+fi
+if [ -n "${REGISTRY_PORT}" ]; then
+    if ! [[ "${REGISTRY_PORT}" =~ ^[0-9]{1,5}$ ]] ||
+        [ "$((10#${REGISTRY_PORT}))" -lt 1 ] || [ "$((10#${REGISTRY_PORT}))" -gt 65535 ]; then
+        echo "PORT/REGISTRY_PORT must be an integer between 1 and 65535" >&2
+        exit 2
+    fi
+    export REGISTRY_PORT="$((10#${REGISTRY_PORT}))"
+fi
+if [ -n "${PORT}" ]; then
     sed -i "s#^PORT=.*#PORT=${PORT}#" "${SERVER_CONF}"
     echo "Config override: PORT=${PORT} (Cloud Run)"
 elif [ -n "${REGISTRY_PORT}" ]; then
@@ -43,23 +64,34 @@ if [ -n "${REGISTRY_ENABLE_HTTPS}" ]; then
 fi
 
 if [ -n "${REGISTRY_FORWARDED_ALLOW_IPS}" ]; then
-    sed -i "s#^forwarded_allow_ips=.*#forwarded_allow_ips=\"${REGISTRY_FORWARDED_ALLOW_IPS}\"#" "${SERVER_CONF}"
+    # No quotes around the value: the config reader strips whitespace only, and
+    # uvicorn compares each trusted-proxy entry literally.
+    sed -i "s#^forwarded_allow_ips=.*#forwarded_allow_ips=${REGISTRY_FORWARDED_ALLOW_IPS}#" "${SERVER_CONF}"
     echo "Config override: forwarded_allow_ips=${REGISTRY_FORWARDED_ALLOW_IPS}"
 fi
 
+# REGISTRY_OWNER_VALIDATION_MODE maps to owner.validation.mode through the
+# REGISTRY_* env overrides in common/util/app_config.py. The legacy
+# double-underscore spelling is still accepted here so existing deployments keep
+# working when they override the image default.
+OWNER_VALIDATION_MODE_OVERRIDE="${REGISTRY_OWNER_VALIDATION_MODE:-${REGISTRY_OWNER__VALIDATION__MODE}}"
+if [ -n "${OWNER_VALIDATION_MODE_OVERRIDE}" ]; then
+    case "${OWNER_VALIDATION_MODE_OVERRIDE}" in
+        strict|relaxed) ;;
+        *) echo "owner validation mode must be strict or relaxed" >&2; exit 2 ;;
+    esac
+    export REGISTRY_OWNER_VALIDATION_MODE="${OWNER_VALIDATION_MODE_OVERRIDE}"
+    sed -i "s#^owner.validation.mode=.*#owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}#" "${SERVER_CONF}"
+    echo "Config override: owner.validation.mode=${OWNER_VALIDATION_MODE_OVERRIDE}"
+fi
 if [ -n "${REGISTRY_OWNER__VALIDATION__MODE}" ]; then
-    sed -i "s#^owner.validation.mode=.*#owner.validation.mode=${REGISTRY_OWNER__VALIDATION__MODE}#" "${SERVER_CONF}"
-    echo "Config override: owner.validation.mode=${REGISTRY_OWNER__VALIDATION__MODE}"
+    echo "REGISTRY_OWNER__VALIDATION__MODE is deprecated; REGISTRY_OWNER_VALIDATION_MODE takes precedence when both are set" >&2
+    unset REGISTRY_OWNER__VALIDATION__MODE
 fi
 
-# When HTTPS is disabled, also disable cert verification and registry signing
-if [ "${REGISTRY_ENABLE_HTTPS}" = "false" ]; then
-    sed -i "s#^verify_client=.*#verify_client=false#" "${SERVER_CONF}"
-    sed -i "s#^registry.sign.enabled=.*#registry.sign.enabled=false#" "${SERVER_CONF}"
-    sed -i "s#^signature_validation_enabled=.*#signature_validation_enabled=false#" "${SERVER_CONF}"
-    sed -i "s#^owner.isolation.enabled=.*#owner.isolation.enabled=false#" "${SERVER_CONF}"
-    echo "Config override: HTTPS disabled → verify_client=false, signing/validation disabled"
-fi
+# TLS may terminate at a trusted reverse proxy. Disabling listener HTTPS must
+# not disable independent caller authorization or AgentCard integrity checks.
+# Development deployments explicitly choose their own policy via REGISTRY_*.
 
 # --- persistence.conf overrides (using # to handle /cloudsql/ paths safely) ---
 if [ -n "${PERSISTENCE_MODE}" ]; then
@@ -152,6 +184,39 @@ if [ "${PERSISTENCE_MODE}" = "gauss" ] || [ "${PERSISTENCE_MODE}" = "mysql" ]; t
         sed -i "s#^${_db_prefix}.connect_timeout=.*#${_db_prefix}.connect_timeout=$(sed_escape "${DB_CONNECT_TIMEOUT}")#" "${PERSISTENCE_CONF}"
         echo "Config override: ${_db_prefix}.connect_timeout=${DB_CONNECT_TIMEOUT}"
     fi
+fi
+
+# --- models.yaml generation (LLM model definitions) ---
+# models.yaml is local configuration and is not shipped in the image. A platform
+# that can only supply environment variables gets the chat entry built here; a
+# file that already exists (for example one bind-mounted by Docker Compose) is
+# left untouched. The key itself is never written: api_key_env only names the
+# variable that holds it. Only the chat capability is generated this way;
+# semantic search needs an embed entry from a complete models.yaml.
+if [ -f "${MODELS_CONF}" ]; then
+    echo "Model config: using existing ${MODELS_CONF}"
+elif [ -n "${LLM_CHAT_MODEL}" ] && [ -n "${LLM_CHAT_URL}" ]; then
+    case "${LLM_CHAT_PROVIDER:-openai_compatible}" in
+        openai|openai_compatible) ;;
+        *) echo "LLM_CHAT_PROVIDER=${LLM_CHAT_PROVIDER} cannot be generated from the simplified environment settings; provide a complete models.yaml" >&2; exit 1 ;;
+    esac
+    mkdir -p "$(dirname "${MODELS_CONF}")"
+    python3 -c "
+import os, yaml
+chat = {
+    'provider': 'openai_compatible',
+    'model': os.environ['LLM_CHAT_MODEL'],
+    'url': os.environ['LLM_CHAT_URL'],
+}
+if os.environ.get('LLM_CHAT_API_KEY'):
+    chat['api_key_env'] = 'LLM_CHAT_API_KEY'
+with open('${MODELS_CONF}', 'w') as f:
+    yaml.safe_dump({'models': {'chat': chat}}, f, sort_keys=False)
+"
+    echo "Config override: models.yaml[chat] generated from environment variables"
+elif [ -n "${LLM_CHAT_MODEL}" ] || [ -n "${LLM_CHAT_URL}" ] || [ -n "${LLM_CHAT_API_KEY}" ]; then
+    echo "Incomplete chat model configuration: set both LLM_CHAT_MODEL and LLM_CHAT_URL" >&2
+    exit 1
 fi
 
 # Ensure run/ directory exists for internal UDS service

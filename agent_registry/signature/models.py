@@ -14,7 +14,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List
 
 
@@ -44,9 +44,9 @@ class JWK(BaseModel):
     kty: str = Field(..., description="Key type, supports EC or RSA only")
     kid: str = Field(..., description="Key ID")
     use: str = Field(default="sig", description="Key usage")
-    alg: str = Field(..., description="Algorithm, e.g., ES256, RS256")
+    alg: Optional[str] = Field(None, description="Optional algorithm, e.g., ES256, RS256")
     crv: Optional[str] = Field(None, description="Curve, e.g., P-256")
-    x: str = Field(..., description="X coordinate (ECDSA) or modulus (RSA)")
+    x: Optional[str] = Field(None, description="X coordinate (ECDSA)")
     y: Optional[str] = Field(None, description="Y coordinate (ECDSA)")
     n: Optional[str] = Field(None, description="Modulus (RSA)")
     e: Optional[str] = Field(None, description="Exponent (RSA)")
@@ -57,6 +57,15 @@ class JWK(BaseModel):
         if v not in ['EC', 'RSA']:
             raise ValueError('Key type only supports EC or RSA')
         return v
+
+    @model_validator(mode='after')
+    def validate_key_material(self):
+        if self.kty == 'RSA':
+            if self.alg not in (None, 'RS256') or not self.n or not self.e:
+                raise ValueError('RS256 RSA keys require n and e')
+        elif self.alg not in (None, 'ES256') or self.crv != 'P-256' or not self.x or not self.y:
+            raise ValueError('ES256 EC keys require P-256, x and y')
+        return self
 
 
 class JWKS(BaseModel):

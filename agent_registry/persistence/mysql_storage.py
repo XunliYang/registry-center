@@ -62,6 +62,9 @@ class MySQLStorage(SqlStorageBackend):
     # MySQL lacks CREATE INDEX IF NOT EXISTS; health/broadcast stores use
     # this flag to pick a duplicate-tolerant plain CREATE INDEX instead.
     supports_create_index_if_not_exists = False
+    # MySQL has no UPDATE ... RETURNING: the outbox allocates versions with
+    # LAST_INSERT_ID(expr) + SELECT LAST_INSERT_ID() instead.
+    dialect = "mysql"
 
     def __init__(self, conn_pool: PooledDB):
         self.pool = conn_pool
@@ -162,6 +165,15 @@ class MySQLStorage(SqlStorageBackend):
 
     def _acquire_conn(self):
         return self.pool.connection()
+
+    def _begin_transaction(self, conn):
+        """Open an explicit transaction on a pooled autocommit connection.
+
+        PooledDB is created with autocommit=True, so without this every
+        statement would commit on its own and the unit of work would be a lie:
+        the record write could not be rolled back when the event insert fails.
+        """
+        conn.begin()
 
     def _release_conn(self, conn):
         conn.close()

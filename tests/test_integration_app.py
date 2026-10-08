@@ -171,8 +171,35 @@ class TestVendorOwnerBinding:
         reg._records[("mine", "tp_org")] = _FakeRecord(make_agent_card("mine", "tp_org"), owner="svc_app")
         stub.principal = _principal(CallerRole.VENDOR_AGENT)
         resp = c.put("/integration/v1/agent-cards/tp_org/mine",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "mine"}]}, headers=_auth_headers())
         assert resp.status_code == 200
+
+    @pytest.mark.parametrize('payload', [{'agentCards': 'text'}, {'agentCards': [False]},
+                                         {'agentCards': [{'unknownField': 1}]}])
+    def test_vendor_malformed_card_is_client_error(self, client, payload):
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.VENDOR_AGENT)
+        response = c.post('/integration/v1/agent-cards', json=payload, headers=_auth_headers())
+        assert response.status_code == 422
+        assert reg._records == {}
+
+    def test_vendor_cannot_rename_card_using_put(self, client):
+        c, stub, reg = client
+        original = make_agent_card('tp_agent', 'tp_org')
+        reg._records[('tp_agent', 'tp_org')] = _FakeRecord(original, owner='svc_app')
+        stub.principal = _principal(CallerRole.VENDOR_AGENT)
+        response = c.put('/integration/v1/agent-cards/tp_org/tp_agent',
+                         json={'agentCards': [{**AGENT_CARD, 'name': 'Renamed'}]}, headers=_auth_headers())
+        assert response.status_code == 422
+        assert reg._records[('tp_agent', 'tp_org')].agent_card == original
+
+    @pytest.mark.parametrize('top_n', [True, False, 1.5, '10', 0, 51, None])
+    def test_semantic_query_rejects_coercion_and_clamping(self, client, top_n):
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.PARTNER_SERVICE)
+        response = c.post('/integration/v1/agent-cards/semantic-query',
+                          json={'task': 'diagnostics', 'topN': top_n}, headers=_auth_headers())
+        assert response.status_code == 422
 
     def test_semantic_query_topn_validation(self, client):
         """topN must be an integer within bounds (422 otherwise, no 500)."""
@@ -185,13 +212,72 @@ class TestVendorOwnerBinding:
                       json={"task": "x", "topN": "abc"}, headers=_auth_headers())
         assert resp.status_code == 422
 
+    def test_semantic_query_malformed_body_is_422(self, client):
+        """A malformed or non-object body is client input, never a 500."""
+        c, stub, reg = client
+        stub.principal = _principal(CallerRole.PARTNER_SERVICE)
+        for body in (b"", b"{not json", b"[]", b"null"):
+            resp = c.post("/integration/v1/agent-cards/semantic-query", content=body,
+                          headers={**_auth_headers(), "content-type": "application/json"})
+            assert resp.status_code == 422, body
+
     def test_nms_can_update_foreign_card(self, client):
         c, stub, reg = client
         reg._records[("foreign", "org")] = _FakeRecord(AGENT_CARD, owner="someone_else")
         stub.principal = _principal(CallerRole.NMS_OSS)
         resp = c.put("/integration/v1/agent-cards/org/foreign",
-                     json={"agentCards": [AGENT_CARD]}, headers=_auth_headers())
+                     json={"agentCards": [{**AGENT_CARD, "name": "foreign",
+                                           "provider": {**AGENT_CARD["provider"], "organization": "org"}}]},
+                     headers=_auth_headers())
         assert resp.status_code == 200
+
+
+class TestVisibilityRuleIsSharedWithTheMainPort:
+    """The integration port must not keep a second copy of the visibility rule.
+
+    It previously compared the status string inline and dropped the health-based
+    hiding into the same branch, so any change to `_is_discoverable()` (the main
+    port's single rule) would silently diverge here.
+    """
+
+    def test_query_calls_the_shared_predicate(self, client, monkeypatch):
+        c, stub, reg = client
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(make_agent_card("tp_agent", "tp_org"))
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+        seen = []
+
+        def spy(name, organization, registry):
+            seen.append((name, organization))
+            return True
+
+        monkeypatch.setattr(app_module, "_is_discoverable", spy)
+        resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
+        assert resp.status_code == 200
+        assert len(resp.json()["agentCards"]) == 1
+        assert seen == [("tp_agent", "tp_org")]
+
+    def test_get_by_key_calls_the_shared_predicate(self, client, monkeypatch):
+        c, stub, reg = client
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(make_agent_card("tp_agent", "tp_org"))
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+        monkeypatch.setattr(app_module, "_is_discoverable", lambda n, o, r: False)
+
+        resp = c.get("/integration/v1/agent-cards/tp_org/tp_agent", headers=_auth_headers())
+
+        assert resp.status_code == 200
+        assert resp.json()["agentCards"] == []
+
+    def test_pending_card_is_hidden_on_both_endpoints(self, client):
+        c, stub, reg = client
+        card = make_agent_card("tp_agent", "tp_org")
+        reg._records[("tp_agent", "tp_org")] = _FakeRecord(card, status="registered")
+        stub.principal = _principal(CallerRole.ANALYTICS_TOOL)
+
+        listed = c.get("/integration/v1/agent-cards", headers=_auth_headers())
+        exact = c.get("/integration/v1/agent-cards/tp_org/tp_agent", headers=_auth_headers())
+
+        assert listed.json()["agentCards"] == []
+        assert exact.json()["agentCards"] == []
 
 
 class TestRegistrationOwnership:
@@ -208,13 +294,13 @@ class TestRegistrationOwnership:
 class TestAuthFailures:
     def test_missing_credentials_returns_401(self, client):
         c, stub, reg = client
-        stub.error = AuthFailureReason.MISSING_CREDENTIALS
+        stub.error = AuthenticationError(AuthFailureReason.MISSING_CREDENTIALS)
         resp = c.get("/integration/v1/agent-cards")
         assert resp.status_code == 401
 
     def test_bad_secret_returns_401(self, client):
         c, stub, reg = client
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert resp.status_code == 401
         body = resp.json()
@@ -236,7 +322,7 @@ class TestBanIntegration:
         c, stub, reg = client
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         for _ in range(3):
             resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
             assert resp.status_code == 401
@@ -255,14 +341,14 @@ class TestBanIntegration:
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
         stub.credentials = {"svc_app": object()}  # claimed appcode is known
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         stub.error = None
         stub.principal = _principal(CallerRole.NMS_OSS)
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 200
         # one more failure after a success must not ban (counter was cleared)
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert resp.status_code == 401
         assert "banned" not in resp.json()["errors"]["error"][0]["errorMessage"].lower()
@@ -276,7 +362,7 @@ class TestBanIntegration:
         tp_app._ban_tracker = tp_app.BanTracker(threshold=3, cooldown_seconds=60)
         tp_app._tp_rate_item = parse_rate_limit("1000/second")
         tp_app._tp_prerate_item = parse_rate_limit("1000/second")
-        stub.error = AuthFailureReason.INVALID_TOKEN
+        stub.error = AuthenticationError(AuthFailureReason.INVALID_TOKEN)
         for i in range(3):  # every attempt uses a different appcode
             resp = c.get("/integration/v1/agent-cards",
                          headers={"X-App-Code": f"rotated_{i}", "X-App-Secret": "x"})
@@ -299,12 +385,12 @@ class TestBanIntegration:
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 200
         assert c.get("/integration/v1/agent-cards", headers=_auth_headers()).status_code == 429
 
-    def test_handler_returning_none_is_auth_failure_not_500(self, client):
-        """A misbehaving custom authn handler returning None must yield 401."""
+    def test_handler_returning_none_is_provider_failure_not_500(self, client):
+        """A provider contract defect must not be attributed to caller credentials."""
         c, stub, reg = client
         stub.principal = None
         resp = c.get("/integration/v1/agent-cards", headers=_auth_headers())
-        assert resp.status_code == 401
+        assert resp.status_code == 503
 
     def test_auth_failure_operation_attribution(self, client, monkeypatch):
         """Auth failures are audited with the ACTUAL operation, not always Register."""
@@ -317,7 +403,7 @@ class TestBanIntegration:
 
         monkeypatch.setattr(audit_module, "_audit_handle", _Rec())
         c, stub, reg = client
-        stub.error = AuthFailureReason.MISSING_CREDENTIALS
+        stub.error = AuthenticationError(AuthFailureReason.MISSING_CREDENTIALS)
         c.get("/integration/v1/agent-cards", headers=_auth_headers())
         assert entries[0]["operation_name"] == "Query Agent"
 

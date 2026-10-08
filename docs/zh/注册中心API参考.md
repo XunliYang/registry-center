@@ -1,4 +1,4 @@
-﻿<!--
+<!--
 Copyright (c) 2026 Huawei Technologies Co., Ltd.
 All Rights Reserved.
 
@@ -39,6 +39,11 @@ SPDX-License-Identifier: Apache-2.0
 ### 约束与限制
 
   具体内容请参见各接口的接口约束。
+
+  AgentCard 登记/更新的 `agentCards` 必须为非空对象列表，每项符合 AgentCard
+  schema。PUT 中每张 Card 的 `name`、`provider.organization` 必须与 URL 一致，
+  不承担身份重命名，也不会改写已签名正文。不合法条目返回 422；此前条目已成功
+  时，`registeredAgents` / `updatedAgents` 保留部分成功记录，整批并非全有或全无事务。
 
 ## 注册AgentCard
 
@@ -796,7 +801,7 @@ SPDX-License-Identifier: Apache-2.0
 
 - 功能描述
 
-    该接口接收自然语言任务描述作为输入，通过语义理解能力分析任务意图，最终输出与任务最匹配的Agent列表。语义检索依赖LLM服务，需在common/config/llm_config.json中配置可用的chat模型；LLM服务不可用时返回200和空agentCards列表，与无匹配Agent不可区分。
+    该接口接收自然语言任务描述并选择匹配的已发布 Agent；待审批 Card 在构造模型提示词前即被过滤。需在 `etc/config/models.yaml` 中配置可用的 `chat` 能力（通过 `api_key_env` 指明密钥所在的环境变量，值放在进程环境变量或 `.env`）。模型未配置、调用失败或返回无法解析的内容时返回 503；正常检索无匹配时才返回 200 和空 agentCards 列表。
 
 - 接口约束
 
@@ -818,6 +823,11 @@ SPDX-License-Identifier: Apache-2.0
     |------|--------|----|-----|----------------------------------------|
     | task | string | 是  | -   | 自然语言任务描述，用于语义检索相关Agent。例如："需要查询意图报告"等。 |
     | layer | string | 否  | -   | 按注册层级过滤候选Agent。层级为非空字符串，最长64个字符，大小写按原值匹配。 |
+    | topN | integer | 否 | 10 | 集成端口使用的返回数量上限，取值范围 1–50；主端口使用查询参数 `top_n`。 |
+
+  `task` 必须为非空白字符串，最多 10,000 个字符。集成端口不接受布尔值、
+  小数或数字字符串作为 `topN`，不再强制转换或截断。不合法的任务描述或数量
+  参数在模型调用前返回 422。
 
 - 请求示例
 
@@ -1217,8 +1227,10 @@ SPDX-License-Identifier: Apache-2.0
   | 状态码 | 说明           |
   |--------|--------------|
   | 200 | 获取成功。        |
+  | 422 | 获取失败，请求体不是 JSON 对象。 |
   | 429 | 获取失败，超过流控限制。 |
   | 500 | 获取失败，服务内部错误。 |
+  | 503 | 获取失败，模型不可用或返回了不可用的选择结果。 |
 
 ## Agent心跳上报
 
@@ -1234,6 +1246,8 @@ SPDX-License-Identifier: Apache-2.0
 
   - 仅当`heartbeat.enabled=true`时进行健康跟踪；开关关闭时接口返回200但`heartbeat_enabled`为false，不做任何记录。
   - Agent必须已注册，未注册的Agent返回404。
+  - 开启`owner.isolation.enabled=true`时，只有该卡片的owner能上报心跳：身份无法验证返回401，
+    非owner返回403（心跳决定健康隐藏、离线TTL自动注销与公开健康事件，属所有权声明）。
   - 接口流控：默认100次/秒/IP，可通过`flowcontrol.ratelimit.heartbeat`配置。
   - 心跳时间以服务端接收时间为准，不信任请求携带的时间戳。
 
@@ -1388,7 +1402,7 @@ SPDX-License-Identifier: Apache-2.0
 
   - 仅当`broadcast.enabled=true`时可用，否则返回503。
   - callback_url必须为HTTPS地址；开发环境可通过`broadcast.allow.http.callbacks=true`放开HTTP。
-  - 配置`broadcast.callback.allowlist`后，仅白名单内的回调主机可用。
+  - `broadcast.callback.allowlist`为必填：白名单为空时请求被拒绝（422），且不会发起投递。
   - 接口流控：默认50次/秒/IP。
 
 - 调用方法

@@ -61,11 +61,18 @@ agent_registry/knowledge_graph_api/
 ## 配置
 
 ### 数据库配置
+
+配置项位于 `etc/conf/persistence.conf`，键名前缀为 `neo4j.`（代码按此前缀读取，
+`agent_registry/knowledge_graph_api/router.py`）：
+
 ```
-database.uri=bolt://localhost:7687
-database.username=neo4j
-database.password=password
+neo4j.uri=bolt://localhost:7687
+neo4j.username=neo4j
+neo4j.password=password
 ```
+
+三项均未配置时使用上述默认值。生产环境请通过环境变量注入密码
+（`persistence.conf` 支持 `${VAR:default}` 形式），不要把口令写进配置文件。
 
 ### 启动数据库服务
 ```bash

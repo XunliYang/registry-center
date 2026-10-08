@@ -1,0 +1,43 @@
+# Copy to models.yaml or mount one shared file into both services.
+# Model definitions belong here; only credentials belong in .env/secrets.
+#
+# The keys present under `models:` are the loaded capabilities; drop the
+# leading "# " to enable one. Capabilities: chat, embed, rerank.
+# Providers: openai_compatible (OpenAI wire contract; the legacy alias `openai`
+# also works) and aoc_signed (signed gateway requests). Every `*_env` field
+# names the environment variable (or repository-root .env key) that holds the
+# secret. Optional per capability: description, timeout (seconds, default 60),
+# verify_ssl (default true), enable_thinking (chat only, default false).
+models:
+  chat:
+    provider: openai_compatible
+    model: your-model
+    url: https://provider.example/v1/chat/completions
+    api_key_env: LLM_CHAT_API_KEY
+    timeout: 300
+    verify_ssl: true
+    # enable_thinking: false
+  # embed:
+  #   provider: openai_compatible
+  #   model: your-embedding-model
+  #   url: https://provider.example/v1/embeddings
+  #   api_key_env: LLM_EMBED_API_KEY
+  #   timeout: 60
+  #   verify_ssl: true
+  # rerank:
+  #   provider: aoc_signed
+  #   model: your-reranker-model
+  #   url: https://gateway.example/rerank
+  #   timeout: 60
+  #   auth:
+  #     app_key_env: LLM_RERANK_AUTH_APP_KEY
+  #     app_secret_env: LLM_RERANK_AUTH_APP_SECRET
+  #     authorization_env: LLM_RERANK_AUTH_AUTHORIZATION
+  #     api_code: your-api-code
+  # An OpenAI-compatible reranker works too (pick one rerank block):
+  # rerank:
+  #   provider: openai_compatible
+  #   model: your-reranker-model
+  #   url: https://provider.example/v1/rerank
+  #   api_key_env: LLM_RERANK_API_KEY
+  #   timeout: 60

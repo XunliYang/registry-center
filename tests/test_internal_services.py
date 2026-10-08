@@ -504,6 +504,18 @@ class TestApprovalHandler:
         assert result["error"] == "db down"
         assert result["message"] == "Failed to update agent status"
 
+    def test_update_status_rejected_returns_error(self, handler, registry, audit_recorder):
+        """A False return (e.g. no authoritative storage) must not be audited as success."""
+        registry.update_status.return_value = False
+
+        result = handler.handle({"agent_name": "a1", "organization": "org1"},
+                                registry, {"agent_approval_enabled": "true"})
+
+        assert result["success"] is False
+        assert result["error"] == "Failed to update agent status"
+        assert result["message"] == "Agent 'a1' status was not changed to published"
+        assert audit_recorder.entries[0]["result"] == OperationResult.FAILURE
+
 
 # ---------- GetAgentHandler ----------
 
@@ -691,6 +703,17 @@ class TestSetTagsHandler:
         assert result["success"] is False
         assert result["error"] == "Agent not found"
         registry.update_agent_tags.assert_not_called()
+
+    def test_update_agent_tags_rejected_returns_error(self, handler, registry, audit_recorder):
+        """A False return must not be audited as a successful tag update."""
+        registry.update_agent_tags.return_value = False
+
+        result = handler.handle({"agent_name": "a1", "organization": "org1",
+                                 "tags": ["production"]}, registry, {})
+
+        assert result["success"] is False
+        assert result["error"] == "Failed to update tags"
+        assert audit_recorder.entries[0]["result"] == OperationResult.FAILURE
 
     def test_success_sets_tags_and_audits_success(self, handler, registry, audit_recorder):
         result = handler.handle({"agent_name": "a1", "organization": "org1",

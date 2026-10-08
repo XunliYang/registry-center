@@ -47,6 +47,11 @@ class AgentRecord:
 
 
 class StorageBackend(ABC):
+    # Whether the backend can group several writes into one commit (see
+    # SqlStorageBackend.transaction). File/memory backends cannot, which is why
+    # derived projections must not be built on them.
+    supports_transactions = False
+
     @classmethod
     @abstractmethod
     def init(cls, config: dict) -> 'StorageBackend':
@@ -70,7 +75,8 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
-    def find_all(self) -> List[AgentCard]:
+    def find_all(self, status: Optional[str] = None) -> List[AgentCard]:
+        """Get all agents; when ``status`` is given, only agents in that status."""
         pass
 
     @abstractmethod

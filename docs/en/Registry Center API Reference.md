@@ -1,4 +1,4 @@
-﻿<!--
+<!--
 Copyright (c) 2026 Huawei Technologies Co., Ltd.
 All Rights Reserved.
 
@@ -38,6 +38,13 @@ SPDX-License-Identifier: Apache-2.0
 ### Constraints and Limitations
 
   For details, see the interface constraints of each API.
+
+  For AgentCard registration/update, `agentCards` must be a non-empty list of
+  objects conforming to the AgentCard schema. PUT requires each Card's `name`
+  and `provider.organization` to match the URL; it never renames an identity or
+  rewrites signed payloads. A malformed item returns 422; if earlier items in
+  the batch succeeded, `registeredAgents` / `updatedAgents` records that partial
+  success. The batch is not an all-or-nothing transaction.
 
 ## Register AgentCard
 
@@ -775,7 +782,7 @@ SPDX-License-Identifier: Apache-2.0
 
 - Description
 
-    This API receives a natural language task description as input, analyzes the task intent through semantic understanding capabilities, and ultimately outputs the list of Agents best matching the task. Semantic retrieval depends on the LLM service configured in common/config/llm_config.json (chat model); when the LLM service is unavailable, the API returns 200 with an empty agentCards list, indistinguishable from "no match".
+    This API receives a natural language task description and selects matching published Agents. Pending cards are excluded before the selection model is called. Semantic retrieval depends on the `chat` capability defined in `etc/config/models.yaml` — the entry names its secret through `api_key_env`, and the value comes from the process environment or `.env`. Missing model configuration, model invocation failure, or invalid model output returns 503; a successful search with no matches returns 200 with an empty agentCards list.
 
 - Interface Constraints
 
@@ -795,7 +802,13 @@ SPDX-License-Identifier: Apache-2.0
 
     | Parameter Name | Type     | Required | Default | Description                                                              |
     |------|--------|----|-----|-------------------------------------------------------------------|
-    | task | string | Yes  | -   | Natural language task description for semantically searching related Agents. For example: "Need to query intent reports", etc. |
+    | task | string | Yes  | -   | Non-blank natural language task description, at most 10,000 characters. |
+
+  The main port accepts the query parameter `top_n` (default 10, integer 1–50).
+  The integration port accepts the JSON field `topN` with the same default and
+  bounds; it rejects booleans, fractions and numeric strings rather than
+  coercing or clamping them. Invalid task/count input returns 422 before any
+  model call.
 
 - Request Example
 
@@ -980,8 +993,10 @@ SPDX-License-Identifier: Apache-2.0
   | Status Code | Description                     |
   |--------|---------------------------|
   | 200 | Retrieval successful.              |
+  | 422 | Retrieval failed, the request body is not a JSON object. |
   | 429 | Retrieval failed, rate limit exceeded. |
   | 500 | Retrieval failed, internal service error. |
+  | 503 | Retrieval failed, the model is unavailable or returned an unusable selection. |
 
 ## Report Agent Heartbeat
 
@@ -996,6 +1011,7 @@ SPDX-License-Identifier: Apache-2.0
 - Constraints
 
   - Health tracking takes effect only when `heartbeat.enabled=true`; when disabled, the API returns 200 with `heartbeat_enabled` set to false and records nothing.
+  - With `owner.isolation.enabled=true` only the card's owner may report a heartbeat: an unverifiable caller gets 401 and a non-owner gets 403 (the claim drives health hiding, the offline TTL and public health events).
   - The Agent must be registered; unregistered Agents receive 404.
   - Rate limit: 100 requests/second/IP by default, configurable via `flowcontrol.ratelimit.heartbeat`.
   - The heartbeat time is always the server-side receive time; timestamps provided by the request are not trusted.
@@ -1151,7 +1167,7 @@ SPDX-License-Identifier: Apache-2.0
 
   - Available only when `broadcast.enabled=true`; otherwise 503.
   - callback_url must be HTTPS; HTTP can be allowed in development via `broadcast.allow.http.callbacks=true`.
-  - When `broadcast.callback.allowlist` is configured, only allowlisted callback hosts are accepted.
+  - `broadcast.callback.allowlist` is mandatory: an empty allowlist rejects the request (422) and no delivery is attempted.
   - Rate limit: 50 requests/second/IP by default.
 
 - Method

@@ -1,4 +1,4 @@
-﻿<!--
+<!--
 Copyright (c) 2026 Huawei Technologies Co., Ltd.
 All Rights Reserved.
 
@@ -27,7 +27,7 @@ Registry Center is a service focused on unified Agent management, enabling users
 ### Functional Limitations
 
 - This project is intended as a functional module only, not a complete system. The module itself does not provide login authentication, authorization, user management, audit logging, encryption/decryption, key management, database, or other capabilities. These security infrastructures must be provided by the customer system. Hook methods have been reserved in the source code for secondary customization.
-- By default, registered Agents are treated as public resources. There is currently no Agent owner design.
+- Registered Agents are shared resources by default: read paths expose only cards whose status is `published`. Ownership enforcement (`owner.isolation.enabled`) is off by default; when enabled, the owner comes from the verified TLS client certificate or an explicitly trusted proxy, and cards without an owner require administrative ownership assignment. See the [Security Guide](Registry%20Center%20Security%20Guide.md) for the identity trust chain.
 - AgentCards registered with this project must not contain personal data such as phone numbers, or sensitive information such as passwords or credentials, as doing so poses a risk of information leakage.
 - This project only supports AgentCard registration in Chinese and English.
 - Currently supports single-instance deployment, intended for internal systems only. It must not be exposed to the public internet and must not be deployed as a cloud service.
@@ -117,7 +117,7 @@ Registry Center is a service focused on unified Agent management, enabling users
     Configuration file paths:
     - Service configuration: `etc/conf/server.conf`
     - Persistence configuration: `etc/conf/persistence.conf`
-    - LLM configuration: `common/config/llm_config.json` (see [Appendix 4](#appendix-4-llm-configuration-guide) for details)
+    - LLM configuration: model definitions in `etc/config/models.yaml`, secrets in `.env` or the process environment (see [Appendix 4](#appendix-4-llm-configuration-guide))
 
 5. Certificate preparation
 
@@ -137,69 +137,7 @@ Registry Center is a service focused on unified Agent management, enabling users
 
 6. Configure the LLM
 
-      The Registry Center relies on an LLM for intelligent Agent selection and an Embedding model for vector retrieval. Edit `common/config/llm_config.json`:
-    
-     ```json
-     {
-       "chat": {
-         "description": "Chat/LLM model for agent operations",
-         "model": "Qwen3_32B",
-         "url": "http://AOC_HOST:PORT/aoc/openapi/YOUR_CHAT_ENDPOINT",
-         "api_key": "dummy",
-         "enable_thinking": false,
-         "auth": {
-           "type": "aoc_signed",
-           "app_key": "YOUR_APP_KEY",
-           "app_secret": "YOUR_APP_SECRET",
-           "authorization": "Bearer YOUR_BEARER_TOKEN",
-           "api_code": "YOUR_API_CODE"
-         },
-         "body": {
-           "model": "$MODEL",
-           "messages": [{"role": "user", "content": "$PROMPT"}],
-           "chat_template_kwargs": {"enable_thinking": "$ENABLE_THINKING"}
-         },
-         "response": {
-           "answer": "choices.0.message.content",
-           "reasoning": "choices.0.message.reasoning_content"
-         }
-       },
-       "embed": {
-         "description": "Embedding model for vector similarity",
-         "model": "bge-m3",
-         "url": "http://AOC_HOST:PORT/aoc/openapi/YOUR_EMBED_ENDPOINT",
-         "api_key": "dummy",
-         "enable_thinking": false,
-         "auth": {
-           "type": "aoc_signed",
-           "app_key": "YOUR_APP_KEY",
-           "app_secret": "YOUR_APP_SECRET",
-           "authorization": "Bearer YOUR_BEARER_TOKEN",
-           "api_code": "YOUR_API_CODE"
-         },
-         "body": { "model": "$MODEL", "input": "$PROMPT" },
-         "response": { "embedding": "data.0.embedding" }
-       },
-       "rerank": {
-         "description": "Reranker model for result reordering",
-         "model": "bge-reranker-v2-m3",
-         "url": "http://AOC_HOST:PORT/aoc/openapi/interface/bge-reranker-v2-m3",
-         "api_key": "dummy",
-         "enable_thinking": false,
-         "auth": {
-           "type": "aoc_signed",
-           "app_key": "YOUR_APP_KEY",
-           "app_secret": "YOUR_APP_SECRET",
-           "authorization": "Bearer YOUR_BEARER_TOKEN",
-           "api_code": "YOUR_API_CODE"
-         },
-         "body": { "model": "$MODEL", "query": "$QUERY", "documents": "$DOCUMENTS" },
-         "response": { "results": "results" }
-       }
-     }
-     ```
-    
-     Replace the placeholder values (`YOUR_*`) with actual configuration. For detailed field descriptions, see [Appendix 4: LLM Configuration Guide](#appendix-4-llm-configuration-guide).
+    Define each capability under `models:` in `etc/config/models.yaml` and name its secret through `api_key_env` there, keeping the value in the repository-root `.env` or process environment. Use `provider: aoc_signed` with `auth.app_key_env` / `auth.app_secret_env` for AOC endpoints. See [Appendix 4](#appendix-4-llm-configuration-guide) and [`models.yaml.example`](../../etc/config/models.yaml.example).
 
 7. Verify the environment setup
 
@@ -585,6 +523,8 @@ The Registry Center provides a CLI command-line tool for local management of Age
 
 The Registry Center supports Agent heartbeat detection and change broadcast: Agents periodically report liveness, and the Registry Center maintains health status (healthy/suspect/offline) based on the failure threshold. Registry data changes (registration, update, deregistration, health changes) are pushed to subscribers via webhooks in real time, with a version-based reconciliation API. Both capabilities are disabled by default and must be enabled in server.conf; once enabled, they are fully backward compatible with existing deployments.
 
+Switches belong in `etc/conf/server.conf`; heartbeat periods, failure thresholds, rate limits and notification delivery policies belong in `etc/conf/server.properties`. The initialization wizard configures deployment and switches, without rewriting business policies.
+
 ### Development Steps
 
 1. Enable the capabilities (etc/conf/server.conf)
@@ -618,7 +558,7 @@ The Registry Center supports Agent heartbeat detection and change broadcast: Age
 
     Notes:
     - Administrators can monitor Agent health via `GET /rest/v1/registry-center/agents/health` with optional status filtering.
-    - Offline Agents are marked but not hidden by default; automatic hiding can be enabled via `heartbeat.hide.unhealthy.results=true`.
+    - Offline Agents are marked but not hidden by default; automatic hiding from task-discovery results can be enabled via `heartbeat.hide.unhealthy.results=true`. The health list/history/SSE are not affected by this switch, so offline alerts remain visible.
 
 ## Configuration Extension Scenario
 
@@ -664,7 +604,21 @@ Implement custom functionality through extended configuration, including storage
 3. Configure vector database
 
     ```properties
-    # Enable vector database (for semantic search optimization)
+    # Enable vector database
+    #
+    # WARNING: this switch does not add a semantic-search index on top of the
+    # existing store - it replaces it. When enabled, RegistryCore no longer
+    # initializes the file/SQL backend, AgentCards are written only to the
+    # vector DB, and approval (update_status), tags (including tag entities),
+    # card listings, ownership, metadata and timestamps report HTTP 503
+    # (AuthoritativeStoreUnavailable) instead of silently returning empty
+    # values. Updates and deregistration are refused too, because they could not
+    # announce themselves to the change feed. Registration and exact card lookup
+    # still work, so the collection can be populated and read by key.
+    # Do not enable this in production; set startup.strict.storage=true to make
+    # the process refuse to start in this mode.
+    # The intended "authoritative store + rebuildable index" layering is a
+    # future refactor and is not implemented yet.
     use_vectordb=true
     ```
 
@@ -681,6 +635,8 @@ The Registry Center supports pluggable persistence backends selected via `persis
 | mysql | MySQL 5.7+ / 8.0 | PyMySQL + DBUtils |
 
 All SQL backends share one CRUD engine (`agent_registry/persistence/sql_backend.py`) and provide their dialect-specific SQL in `agent_registry/persistence/sql_queries.py`. Adding a new database type requires: a new query enum, a `SqlStorageBackend` subclass, a factory branch in `agent_registry/persistence/__init__.py`, and a config block in `persistence.conf`.
+
+In SQL mode, initialize the broadcast service with the same storage instance before writing Agent records: `initialize_broadcast_service(registry.storage, registry.persistence_mode)`. The normal server startup does this automatically. Embedded callers, CLI scripts, and tests must do it explicitly; otherwise writes fail before changing the record. If a broadcast singleton was created earlier with a file or memory outbox, startup fails rather than silently using a non-transactional outbox. File/vector modes do not require this SQL binding.
 
 ### Configuration example (MySQL)
 
@@ -804,10 +760,10 @@ The system adopts a configuration-driven, single generic HTTP client architectur
 
 | Component | Responsibility |
 |-----------|----------------|
-| GenericLLM | The only concrete LLM implementation class, all behavior driven by JSON config |
-| ModelConfig | Dataclass mapping each capability section of llm_config.json to a structured config |
+| GenericLLM | The concrete LLM implementation, driven by provider profiles |
+| ModelConfig | Structured model settings for each capability |
 | AUTH_STRATEGIES | Pluggable authentication strategy registry (dict), add custom sign/auth functions as needed |
-| llm_config.json | Single configuration file, keyed by "chat"/"embed"/"rerank" for each capability |
+| model_sources.py | Environment settings source and extensible provider profiles |
 
 ```
 ┌─────────────────────┐
@@ -825,7 +781,7 @@ The system adopts a configuration-driven, single generic HTTP client architectur
 │    GenericLLM       │◄── Single implementation, no inheritance
 │ (config-driven HTTP)│
 └──────────┬──────────┘
-           ├─── Reads llm_config.json (ModelConfig)
+           ├─── Reads environment settings (ModelConfig)
            ├─── Selects auth strategy (AUTH_STRATEGIES)
            ├─── Renders body template ($VARIABLE substitution)
            └─── Parses response (dot/bracket path navigation)
@@ -836,7 +792,7 @@ The system adopts a configuration-driven, single generic HTTP client architectur
 {install_dir}/registry-center/
 ├── common/
 │   ├── config/
-│   │      └── llm_config.json           # LLM configuration file
+│   │      └── README_en.md              # LLM model settings guide
 │   ├── custom/
 │   │      ├── __init__.py               # Custom handler registration file (create by user)
 │   │      ├── interface_type.py         # Interface type enumeration
@@ -846,8 +802,9 @@ The system adopts a configuration-driven, single generic HTTP client architectur
 │       ├── llm.py                       # Factory functions + singleton cache
 │       ├── config/
 │       │      ├── __init__.py
-│       │      ├── config_reader.py      # JSON file reader utility
-│       │      └── llm_config.py         # ModelConfig dataclass
+│       │      ├── config_reader.py      # JSON file reader utility (vector DB config)
+│       │      ├── llm_config.py         # ModelConfig dataclass
+│       │      └── model_sources.py      # models.yaml loader + provider profiles
 │       └── provider/
 │              ├── __init__.py
 │              ├── generic_llm.py        # GenericLLM implementation
@@ -1005,347 +962,11 @@ print("Verification passed")
 
 ### Custom LLM Usage
 
-#### Feature Description
+The Registry Center reads model definitions from `etc/config/models.yaml` and secrets from the process environment or the repository-root `.env`; environment variables take precedence and empty values do not mask `.env`. See [LLM configuration](../../etc/config/README_en.md) and [`.env.example`](../../.env.example).
 
-**Core Capabilities:**
-- **Configuration-Driven**: All LLM behavior (URL, model, auth, request body, response parsing) is defined via `llm_config.json` — no code required
-- **Single Implementation Class**: `GenericLLM` is the only concrete class for all LLM capabilities; switch capabilities via config, no inheritance needed
-- **Pluggable Authentication**: Register custom auth functions via the `AUTH_STRATEGIES` dict, supporting any sign/auth scheme
-- **Instance Caching**: Singleton pattern manages LLM instances (cached by capability), avoiding redundant creation
+Define a `chat` entry for intelligent Agent selection, plus `embed` for semantic retrieval and `rerank` when reranking is enabled. Each capability sets `model` and `url`, and may set `provider`, `description`, `timeout`, `verify_ssl`, `enable_thinking`, and `api_key_env`. The keys present under `models:` are the loaded capabilities. The `provider` field defaults to `openai_compatible` (the legacy alias `openai` is also accepted); `aoc_signed` uses `auth.app_key_env` and `auth.app_secret_env`. Register a new provider profile in `common/llm/config/model_sources.py` to support a different wire protocol without modifying the settings source.
 
-#### When to Customize LLM Configuration
-
-The following scenarios require modifying `llm_config.json` or extending auth strategies:
-
-**Table 6** Custom LLM Configuration Scenarios
-
-| Scenario | Description | Example |
-|----------|-------------|---------|
-| Switching model vendors | When integrating a new LLM API, simply add a new capability section in the config file | Add a "vision" section for a vision model |
-| Non-standard authentication | When the LLM API requires special signing/auth (e.g., HMAC, OAuth), add a new strategy to `auth_strategies.py` | A private deployment platform requiring custom HMAC signing |
-| Non-standard request/response format | When the API body structure differs or the response JSON paths don't match, adjust `body` and `response` fields | A model returning `output.text` instead of `choices[0].message.content` |
-| Adding new capability types | When you need LLM capabilities beyond embedding/rerank (e.g., vision, speech) | Add a "vision" section with corresponding body/response templates |
-
-**Decision Criteria:**
-
-- Most LLM APIs can be integrated by modifying `llm_config.json` alone — no Python code required
-- Only write auth functions in `auth_strategies.py` when a non-standard authentication method is needed
-
-#### Configuration File Format (llm_config.json)
-
-Configuration file path: `common/config/llm_config.json`
-
-```json
-{
-  "chat": {
-    "description": "Chat/LLM model for PSOP generation and execution",
-    "model": "deepseek-chat",
-    "url": "https://api.deepseek.com/v1/chat/completions",
-    "api_key": "<YOUR_API_KEY>",
-    "enable_thinking": true,
-    "verify_ssl": true,
-    "headers": {},
-    "body": {
-      "model": "$MODEL",
-      "messages": [{"role": "user", "content": "$PROMPT"}]
-    },
-    "response": {
-      "answer": "choices[0].message.content",
-      "reasoning": "choices[0].message.reasoning_content"
-    }
-  },
-  "embed": {
-    "description": "Embedding model for vector similarity",
-    "model": "bge-m3",
-    "url": "http://127.0.0.1:3021/aoc/openapi/YOUR_ENDPOINT",
-    "api_key": "dummy",
-    "auth": {
-      "type": "aoc_signed",
-      "app_key": "YOUR_APP_KEY",
-      "app_secret": "YOUR_APP_SECRET",
-      "authorization": "Bearer YOUR_BEARER_TOKEN",
-      "api_code": "YOUR_API_CODE",
-      "api_version": "1.0",
-      "scenario_code": "YOUR_SCENARIO_CODE",
-      "scenario_version": "V1",
-      "ability_code": "YOUR_ABILITY_CODE",
-      "test_flag": "1"
-    },
-    "body": {
-      "model": "$MODEL",
-      "input": "$PROMPT"
-    },
-    "response": {
-      "embedding": "data[0].embedding"
-    }
-  },
-  "rerank": {
-    "description": "Reranker model for result reordering",
-    "model": "bge-reranker-v2-m3",
-    "url": "http://127.0.0.1:3021/aoc/openapi/interface/bge-reranker-v2-m3",
-    "auth": {
-      "type": "aoc_signed",
-      "app_key": "YOUR_APP_KEY",
-      "app_secret": "YOUR_APP_SECRET",
-      "authorization": "Bearer YOUR_BEARER_TOKEN",
-      "api_code": "YOUR_API_CODE",
-      "api_version": "1.0",
-      "scenario_code": "YOUR_SCENARIO_CODE",
-      "scenario_version": "V1",
-      "ability_code": "YOUR_ABILITY_CODE",
-      "test_flag": "1"
-    },
-    "body": {
-      "model": "$MODEL",
-      "query": "$QUERY",
-      "documents": "$DOCUMENTS"
-    },
-    "response": {
-      "results": "results"
-    }
-  }
-}
-```
-
-**Configuration Fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `description` | string | Capability description (for logging/debug only) |
-| `model` | string | Model name, injectable into body via `$MODEL` |
-| `url` | string | LLM API endpoint URL |
-| `api_key` | string | API Key, auto-added as `Authorization: Bearer <api_key>` (auth strategy takes priority) |
-| `enable_thinking` | bool | Enable chain-of-thought, injectable via `$ENABLE_THINKING` |
-| `verify_ssl` | bool | Verify SSL certificates (default: true) |
-| `headers` | dict | Additional static HTTP request headers |
-| `body` | dict | Request body template, supports `$VARIABLE` substitution |
-| `response` | dict | Response extraction path mapping (dot/bracket path navigation) |
-| `auth` | dict/string | Auth config: string = strategy name, dict must include `type` field for strategy name |
-
-**Body Template Variables:**
-
-| Variable | Source | Description |
-|----------|--------|-------------|
-| `$MODEL` | Config `model` field | Model name |
-| `$API_KEY` | Config `api_key` field | API key |
-| `$ENABLE_THINKING` | Config `enable_thinking` field | Enable chain-of-thought |
-| `$PROMPT` | Runtime `prompt` parameter | User input for ask_llm/embed |
-| `$QUERY` | Runtime `query` parameter | Query text for rerank |
-| `$DOCUMENTS` | Runtime `documents` parameter | Candidate document list for rerank |
-
-**Response Path Syntax:**
-
-- Dot-separated nested objects: `choices[0].message.content` → access `data["choices"][0]["message"]["content"]`
-- Bracket index: `choices[0]` → access array element 0
-- Mixed: `data[0].embedding` → access `data["data"][0]["embedding"]`
-
-#### Development Steps
-
-##### Step 1: Add a New LLM Capability
-
-Add a new capability section in `llm_config.json`. For example, integrating a vision model:
-
-```json
-{
-  "chat": { ... },
-  "embed": { ... },
-  "rerank": { ... },
-  "vision": {
-    "description": "Vision model for image understanding",
-    "model": "gpt-4-vision",
-    "url": "https://api.example.com/v1/vision",
-    "api_key": "<YOUR_API_KEY>",
-    "enable_thinking": false,
-    "verify_ssl": true,
-    "headers": {
-      "X-Custom-Header": "value"
-    },
-    "body": {
-      "model": "$MODEL",
-      "messages": [
-        {
-          "role": "user",
-          "content": "$PROMPT"
-        }
-      ]
-    },
-    "response": {
-      "answer": "choices[0].message.content",
-      "reasoning": "choices[0].message.reasoning_content"
-    }
-  }
-}
-```
-
-Then retrieve the instance by capability name:
-
-```python
-from common.llm import get_llm_instance
-
-vision_llm = get_llm_instance("vision")
-reasoning, answer = vision_llm.ask_llm("Describe this image")
-```
-
-> **Note**: No Python code changes are needed. `_get_instance("vision")` automatically reads the `"vision"` section from `llm_config.json` and creates a `GenericLLM` instance.
-
-##### Step 2: Add a New Auth Strategy
-
-If the new LLM API requires non-standard authentication, add an auth function in `common/llm/provider/auth_strategies.py`:
-
-```python
-# In auth_strategies.py
-def _build_my_custom_auth(params: Dict[str, str]) -> Dict[str, str]:
-    """
-    Custom authentication strategy
-
-    Args:
-        params: Parameters from the auth field (excluding "type" key)
-
-    Returns:
-        Dict of HTTP headers to add to the request
-    """
-    # Implement custom signing logic
-    token = params['access_token']
-    return {
-        'Authorization': f'CustomScheme {token}',
-        'X-Client-ID': params.get('client_id', ''),
-    }
-
-AUTH_STRATEGIES["my_custom_auth"] = _build_my_custom_auth
-```
-
-Then reference the strategy in `llm_config.json`:
-
-```json
-"chat": {
-  ...
-  "auth": {
-    "type": "my_custom_auth",
-    "access_token": "your-token",
-    "client_id": "your-client-id"
-  }
-}
-```
-
-##### Step 3: Adjust Request Body Template
-
-If the API has a different request format, modify the `body` field. For example, a model requiring an embedded `stream` parameter:
-
-```json
-"body": {
-  "model": "$MODEL",
-  "messages": [{"role": "user", "content": "$PROMPT"}],
-  "stream": false,
-  "temperature": 0.7,
-  "max_tokens": 4096
-}
-```
-
-##### Step 4: Adjust Response Extraction Path
-
-If the API response structure differs, modify the `response` field. For example:
-
-```json
-"response": {
-  "answer": "output.text",
-  "reasoning": "output.reasoning"
-}
-```
-
-> The above paths correspond to response `{"output": {"text": "Answer content", "reasoning": "Thinking process"}}`
-
-#### API Reference
-
-##### Public Functions
-
-```python
-from common.llm import get_llm_instance, get_embed_instance, get_rerank_instance
-
-# Get chat model instance (default capability="chat")
-llm = get_llm_instance()
-# Or specify another capability
-llm = get_llm_instance("vision")
-
-# Get embedding model instance
-emb = get_embed_instance()      # Equivalent to _get_instance("embed")
-
-# Get reranker model instance
-rerank = get_rerank_instance()   # Equivalent to _get_instance("rerank")
-```
-
-##### GenericLLM Methods
-
-```python
-# ask_llm: Chat/text generation
-reasoning, answer = llm.ask_llm(prompt="Hello, introduce yourself")
-# Returns: (reasoning: str, answer: str)
-
-# embed: Text vectorization
-vector = emb.embed(prompt="This is text to vectorize")
-# Returns: List[float]
-
-# rerank: Document reranking
-results = rerank.rerank(query="search query", documents=["doc1", "doc2", "doc3"])
-# Returns: List[Dict[str, Any]]
-```
-
-##### Default Capabilities
-
-**Table 7** Default LLM Capabilities
-
-| Capability Key | Public Function | Description |
-|----------------|-----------------|-------------|
-| `"chat"` | `get_llm_instance()` | Chat/text generation model, default capability |
-| `"embed"` | `get_embed_instance()` | Embedding/vectorization model |
-| `"rerank"` | `get_rerank_instance()` | Reranker model |
-
-#### Testing and Verification
-
-Verify default capabilities:
-```python
-from common.llm import get_llm_instance, get_embed_instance, get_rerank_instance
-
-# Verify chat model
-llm = get_llm_instance()
-assert llm is not None, "Failed to get LLM instance"
-print(f"Current chat model: {llm.to_dict()}")
-reasoning, answer = llm.ask_llm("What's the weather today?")
-print(f"Answer: {answer}")
-
-# Verify embedding model
-emb = get_embed_instance()
-print(f"Current embedding model: {emb.to_dict()}")
-vector = emb.embed("Test text")
-print(f"Vector dimension: {len(vector)}")
-
-# Verify reranker model
-rerank = get_rerank_instance()
-print(f"Current reranker model: {rerank.to_dict()}")
-results = rerank.rerank("ABC", ["ABCD", "BCDE"])
-print(f"Rerank result count: {len(results)}")
-```
-
-Verify custom capability:
-```python
-from common.llm import get_llm_instance
-
-# Verify new capability (assuming "vision" section added to llm_config.json)
-vision_llm = get_llm_instance("vision")
-assert vision_llm is not None, "Failed to get Vision instance"
-print(f"Vision model: {vision_llm.to_dict()}")
-reasoning, answer = vision_llm.ask_llm("Describe this image")
-print(f"Answer: {answer}")
-```
-
-Verify custom auth strategy:
-```python
-from common.llm.provider.auth_strategies import AUTH_STRATEGIES
-
-# Check if strategy is registered
-assert "my_custom_auth" in AUTH_STRATEGIES, "Auth strategy not registered"
-print(f"Available auth strategies: {list(AUTH_STRATEGIES.keys())}")
-```
-```
+Restart the service after changes; model clients are cached. Use `python -m scripts.migrate_llm_config` for env-only settings or `python -m scripts.migrate_legacy_llm_json` for legacy JSON. Both reject conflicts without printing secrets; custom legacy request templates require a registered profile first.
 
 ## Appendix
 
@@ -1368,11 +989,18 @@ print(f"Available auth strategies: {list(AUTH_STRATEGIES.keys())}")
 | signature_validation_enabled | Signature verification toggle | true                    |
 | agent_approval_enabled | Agent approval toggle | false                   |
 | owner.isolation.enabled | Owner isolation toggle | true                    |
-| use_vectordb | Enable vector database | false                   |
+| use_vectordb | Enable vector database (replaces the authoritative store; see the warning above) | false                   |
+| startup.strict.storage | Refuse to start when use_vectordb=true leaves no authoritative record store | false                   |
 | jwk_cert_path | JWK signing certificate path | etc/ssl/server.cer |
 | jwk_private_key_path | JWK private key directory | etc/sign_cert |
 | jwk_private_key_password | JWK private key passphrase | '' |
 | registry.sign.enabled | Registry Center signing toggle | true |
+
+Note: the owner/identity rows above are the values shipped in the sample
+`etc/conf/server.conf`. The built-in code defaults are
+`owner.isolation.enabled=false`, `owner.validation.mode=strict`, and
+`owner.identity.mode=certificate`; see the
+[Security Guide](Registry%20Center%20Security%20Guide.md).
 
 #### persistence.conf Configuration Items
 
@@ -1385,7 +1013,7 @@ print(f"Available auth strategies: {list(AUTH_STRATEGIES.keys())}")
 | postgresql.port | PostgreSQL port | 5432 |
 | postgresql.name | Database name | registry_center |
 
-#### server.properties Configuration Items (Advanced)
+#### server.properties Configuration Items (Operating Parameters and Business Policies)
 
  The following configuration is in `etc/conf/server.properties`:
 
@@ -1442,123 +1070,8 @@ AgentCard registration must follow security specifications. The following are pr
 For detailed specifications, please refer to [AgentCard Security Specification](../../design/AgentCard_Security_Specification.md).
 
 ### Appendix 4: LLM Configuration Guide
- 
- The LLM module adopts a purely configuration-driven architecture. To integrate a new model, you only need to edit `common/config/llm_config.json` — no Python code is required.
- 
- #### Configuration File Structure
- 
- The top level is grouped by capability:
 
-**Table 12** LLM Capability Grouping Description
-
-| Capability Key | Description | Invocation API |
-|----------------|-------------|----------------|
-| `chat` | Chat/LLM model (text generation) | `get_llm_instance()` |
-| `embed` | Embedding model (text vectorization) | `get_embed_instance()` |
-| `rerank` | Reranker model (result reordering) | `get_rerank_instance()` |
-
- Invoking an unconfigured capability will result in an error. Configure only what you need.
-
- #### Common Configuration Fields
-
-**Table 13** LLM Common Configuration Field Description
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `description` | `string` | No | Model description, used for logging and `to_dict()` |
-| `model` | `string` | No | Model name, injected into request body via `$MODEL` |
-| `url` | `string` | **Yes** | Model API endpoint address |
-| `api_key` | `string` | No | API key; when auth is null, automatically used as Bearer header |
-| `enable_thinking` | `boolean` | No | Thinking mode, injected via `$ENABLE_THINKING` |
-| `auth` | `object/string/null` | No | Authentication strategy (see Authentication Strategies) |
-| `headers` | `object` | No | Additional static HTTP headers |
-| `body` | `object` | **Yes** | Request body template (see Request Body Placeholders) |
-| `response` | `object` | **Yes** | Response extraction path (see Response Extraction Paths) |
-
- #### Authentication Strategies (auth)
-
-**Table 14** Authentication Strategy Description
-
-| Value | Description |
-|-------|-------------|
-| `null` | No special authentication; when `api_key` is non-empty, automatically adds `Authorization: Bearer` header |
-| `{"type": "aoc_signed", ...}` | AOC platform signed Headers (`x-sg-*` series) |
-
- Required parameters for `aoc_signed`: `app_key`, `app_secret`, `authorization`, `api_code`.
-
- Optional parameters have defaults: `scenario_code` ("B99999999999"), `scenario_version` ("V1"), `ability_code` ("A999999999"), `api_version` ("1.0"), `test_flag` ("1").
-
- Extending with a new strategy: register a function in the `AUTH_STRATEGIES` dictionary in `provider/auth_strategies.py`.
-
-
- #### Request Body Placeholders
-
-**Table 15** Request Body Placeholder Description
- 
- | Placeholder | Expands To | Applicable Capability |
- |-------------|------------|-----------------------|
- | `$MODEL` | Value of `model` field | chat, embed, rerank |
- | `$PROMPT` | prompt parameter of `ask_llm()` / `embed()` | chat, embed |
- | `$QUERY` | query parameter of `rerank()` | rerank |
- | `$DOCUMENTS` | documents parameter of `rerank()` | rerank |
- | `$ENABLE_THINKING` | Value of `enable_thinking` field | chat, embed, rerank |
- 
- When a placeholder is an exact string match, the original type is preserved (bool→true/false, list→JSON array); for partial matches, it is replaced as a string.
-
- #### Response Extraction Paths
-
-**Table 16** Response Extraction Path Description
-
- Defines the paths for extracting data from the API response JSON:
- 
- | Capability | response Key | Description |
- |------------|--------------|-------------|
- | chat | `answer` | Answer text extraction path |
- | chat | `reasoning` | Reasoning/thinking process extraction path (optional) |
- | embed | `embedding` | Vector array extraction path |
- | rerank | `results` | Reranking result extraction path |
-
- Path syntax: `.` or `[]` separates field names, numbers represent array indices. For example, `"choices.0.message.content"` and `"choices[0].message.content"` are equivalent.
-
- #### Configuration Examples
- 
- **OpenAI-Compatible API:**
-
- ```json
- {
-   "chat": {
-     "model": "deepseek-chat",
-     "url": "https://api.deepseek.com/v1/chat/completions",
-     "api_key": "sk-xxx",
-     "enable_thinking": true,
-     "auth": null,
-     "body": {
-       "model": "$MODEL",
-       "messages": [{"role": "user", "content": "$PROMPT"}]
-     },
-     "response": {
-       "answer": "choices.0.message.content",
-       "reasoning": "choices.0.message.reasoning_content"
-     }
-   }
- }
- ```
-
- **Minimal Chat Configuration:**
-
- ```json
- {
-   "chat": {
-     "url": "https://api.openai.com/v1/chat/completions",
-     "api_key": "sk-xxx",
-     "body": {
-       "model": "$MODEL",
-       "messages": [{"role": "user", "content": "$PROMPT"}]
-     },
-     "response": { "answer": "choices.0.message.content" }
-   }
- }
- ```
+Model definitions live in the gitignored `etc/config/models.yaml`, while secrets live in the repository-root `.env` or the process environment, which takes precedence. See the complete [LLM configuration reference](../../etc/config/README_en.md). Each capability needs `model` and `url`; `provider` chooses a protocol profile (`openai_compatible`, whose legacy alias `openai` still works, or `aoc_signed`), and other settings include `api_key_env`, `timeout`, `verify_ssl`, and `enable_thinking`. Add or remove a key under `models:` to change the loaded set, and restart the service after edits.
 
 ## FAQ
 
@@ -1645,16 +1158,6 @@ Solutions:
 2. Check that the InterfaceType used for registration and retrieval is consistent
 3. Confirm that the custom handler properly inherits from BaseHandler and implements the handle method
 
-### 9: What to do when a newly added LLM is not registered?
+### 9: What to do when a newly added LLM is unavailable?
 
-Possible causes:
-1. The `@registry_provider` decorator was not used correctly
-2. The custom LLM class was not imported in `__init__.py`
-3. The string value of the LLMType enumeration does not match the key in the configuration file
-4. The custom LLM file was not loaded by the Python interpreter
-
-Solutions:
-1. Confirm that the `@registry_provider(LLMType.YOUR_TYPE)` decorator is used on the custom class definition
-2. Add the import statement in `common/llm/__init__.py`: `from .provider.your_custom_llm import YourCustomLLM`
-3. Check that the LLMType enum value exactly matches the configuration key name in `llm_config.json` (including case)
-4. Ensure the custom LLM module is imported at application startup; it can be imported in `__init__.py` or at the main program entry point
+Check that the capability has an entry under `models:` in `etc/config/models.yaml` with `model` and `url` set, and that its `provider` profile is registered. Process environment values override `.env`. Restart the service after changing settings.

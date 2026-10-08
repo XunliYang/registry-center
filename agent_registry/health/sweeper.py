@@ -21,6 +21,7 @@ from loguru import logger
 from agent_registry.broadcast.events import EventType
 from agent_registry.broadcast.event_bus import EventBus
 from agent_registry.health.state import HealthStatus, compute_status
+from agent_registry.status import is_discoverable_status
 
 
 def _utcnow() -> datetime:
@@ -54,17 +55,23 @@ class HealthSweeper:
                                     self._grace_period)
             if target == state.status:
                 continue
-            if self._registry.get_by_key_with_owner(state.name, state.organization) is None:
+            record = self._registry.get_by_key_with_owner(state.name, state.organization)
+            if record is None:
                 self._service.remove(state.name, state.organization)
                 continue
             previous_status = state.status
             if self._service.update_status(state.name, state.organization, target, now):
+                # Same policy as the public read paths: a stored record with an
+                # empty legacy status counts as published.
+                if not is_discoverable_status(record.status):
+                    continue
                 self._event_bus.publish(EventType.AGENT_HEALTH_CHANGED, {
                     "name": state.name,
                     "organization": state.organization,
                     "health_status": target.value,
                     "previous_health_status": previous_status.value,
                     "tags": self._registry.get_agent_tags(state.name, state.organization),
+                    "discovery_public": True,
                 })
                 transitions += 1
         if self._offline_ttl > 0:

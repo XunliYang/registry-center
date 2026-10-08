@@ -19,6 +19,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Registry Center - Google Cloud Platform 容器化部署指南
 
+此脚本仅适用于**开发演示**，不是生产身份隔离部署。未指定 `-DevelopmentOnly` 时，
+会在创建云资源之前退出。演示明确关闭所有者隔离和签名，并要求 Cloud Run IAM 认证
+（禁止匿名访问）。生产请使用 mTLS 或独立配置可靠身份网关，详见
+[容器部署指南](../container-deployment.md)。
+
+
 本指南帮你**一步一步**把这个注册中心服务部署到 Google Cloud Platform，无需任何技术背景。
 
 ---
@@ -79,7 +85,7 @@ gcloud auth list
 
 ```powershell
 cd 项目目录路径
-.\deploy-all.ps1
+.\deploy-all.ps1 -DevelopmentOnly
 ```
 
 > 把 `项目目录路径` 替换为你解压后 `registry-center` 文件夹的实际路径。例如：
@@ -87,15 +93,15 @@ cd 项目目录路径
 > cd C:\Users\<YourUsername>\Desktop\registry-center
 > ```
 
-> **如果运行 `.\deploy-all.ps1` 报错** "File ... cannot be loaded. The file ... is not digitally signed. You cannot run this script on the current system." / "UnauthorizedAccess"，这是 PowerShell 执行策略（Execution Policy）默认禁止运行未签名脚本导致的。两种解决方法任选其一：
+> **如果运行 `.\deploy-all.ps1 -DevelopmentOnly` 报错** "File ... cannot be loaded. The file ... is not digitally signed. You cannot run this script on the current system." / "UnauthorizedAccess"，这是 PowerShell 执行策略（Execution Policy）默认禁止运行未签名脚本导致的。两种解决方法任选其一：
 > - **方法一（推荐，永久生效）**：为当前用户放开执行策略，本地脚本可直接运行，仅网络下载的脚本才需要签名。
 >   ```powershell
 >   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 >   ```
->   执行后再运行 `.\deploy-all.ps1` 即可。
+>   执行后再运行 `.\deploy-all.ps1 -DevelopmentOnly` 即可。
 > - **方法二（仅本次运行生效）**：不修改系统设置，单次绕过执行策略。
 >   ```powershell
->   powershell -ExecutionPolicy Bypass -File .\deploy-all.ps1
+>   powershell -ExecutionPolicy Bypass -File .\deploy-all.ps1 -DevelopmentOnly
 >   ```
 
 运行后会提示你输入：
@@ -120,13 +126,42 @@ cd 项目目录路径
 
 脚本最后会输出一个 `https://xxxxx.run.app` 的地址，这是你的服务 URL。
 
-在浏览器打开 `https://xxxxx.run.app/rest/v1/registry-center/agent-cards`，如果看到 `{"agentCards":[]}` 就说明服务正常运行（空列表表示还没注册过 Agent）。
+请使用具有 Cloud Run 调用权限的 IAM 身份令牌；匿名浏览器访问会被平台拒绝。
+认证后返回 `{"agentCards":[]}` 表示服务正常运行且还没有注册 Agent。
 
 或者用 PowerShell 测试：
 
 ```powershell
-Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-cards"
+$identityToken = gcloud auth print-identity-token
+Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-cards" -Headers @{ Authorization = "Bearer $identityToken" }
 ```
+
+---
+
+## 配置模型文件
+
+`etc/config/models.yaml` 刻意不打进镜像（已在 `.dockerignore` 中排除），因此新建的容器没有模型
+定义。服务仍会正常启动并提供接口；请求实际需要但模型不可用时返回 HTTP 503。
+候选集为空时可以不调用模型，直接返回 `{"agentCards":[]}`。
+
+提供该文件有两种方式：
+
+1. **Docker Compose** — `docker-compose.yml` 会挂载
+   `${LLM_CONFIG_HOST_FILE:-./etc/config/models.yaml}`，把完整文件放在该路径即可。
+2. **Cloud Run** — 容器入口脚本（`bin/entrypoint.sh`）会在服务启动前，把环境变量转成**不含密钥**的
+   `models.yaml`：
+
+   ```powershell
+   gcloud run services update registry-center --region=asia-east1 --project="YOUR_PROJECT_ID" --update-env-vars="LLM_CHAT_MODEL=deepseek-chat,LLM_CHAT_URL=https://api.deepseek.com/v1/chat/completions"
+   ```
+
+   通过部署平台的密钥机制注入 `LLM_CHAT_API_KEY`；不要把真实密钥写进命令或 Shell 历史。
+
+生成的条目包含 `provider: openai_compatible`、`model`、`url`，并且**仅当**密钥变量存在时才写入
+`api_key_env: LLM_CHAT_API_KEY`——密钥值本身从不落盘。已存在的 `models.yaml` 不会被覆盖，因此挂载的
+文件总是优先。该简化方式只生成 `chat` 能力：需要 `embed` 时请提供完整的 `models.yaml`（自定义镜像或
+挂载卷）。只设置 `LLM_CHAT_MODEL` / `LLM_CHAT_URL` 之一，或指定 `aoc_signed` 等 provider，容器会直接
+报错退出，而不是带着半套配置启动。字段说明见 [LLM 配置参考](../../etc/config/README_zh.md)。
 
 ---
 
@@ -163,15 +198,15 @@ Invoke-RestMethod -Uri "https://xxxxx.run.app/rest/v1/registry-center/agent-card
 
 **Q: 看到 "API has not been used" 错误？**
 
-等 1-2 分钟再运行 `.\deploy-all.ps1`，有些 API 启用需要时间。
+等 1-2 分钟再运行 `.\deploy-all.ps1 -DevelopmentOnly`，有些 API 启用需要时间。
 
 **Q: 部署失败怎么重试？**
 
-直接再跑一次 `.\deploy-all.ps1` 就行，已创建的资源会被自动跳过。
+直接再跑一次 `.\deploy-all.ps1 -DevelopmentOnly` 就行，已创建的资源会被自动跳过。
 
 **Q: 如何更新服务？**
 
-修改代码后，再跑一次 `.\deploy-all.ps1` 即可更新。
+修改代码后，再跑一次 `.\deploy-all.ps1 -DevelopmentOnly` 即可更新。
 
 **Q: 如何关掉服务？**
 

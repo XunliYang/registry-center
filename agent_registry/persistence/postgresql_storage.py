@@ -36,6 +36,7 @@ class PostgreSQLStorage(SqlStorageBackend):
 
     queries = PostgreSQLQueries
     _integrity_error = psycopg2.IntegrityError
+    dialect = "postgresql"
 
     def __init__(self, conn_pool: pool.ThreadedConnectionPool):
         self.pool = conn_pool
@@ -78,6 +79,13 @@ class PostgreSQLStorage(SqlStorageBackend):
         return self.pool.getconn()
 
     def _release_conn(self, conn):
+        if not conn.closed:
+            # Callers outside an explicit unit of work may leave a read
+            # transaction open, and bootstrap/test setup can temporarily enable
+            # autocommit. Return a clean connection to the pool so the next
+            # request can rely on transaction() for atomic writes.
+            conn.rollback()
+            conn.autocommit = False
         self.pool.putconn(conn)
 
     # ---- tag param: PG uses JSONB containment operator ----

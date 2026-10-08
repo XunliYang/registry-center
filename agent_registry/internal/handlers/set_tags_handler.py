@@ -122,7 +122,24 @@ class SetTagsHandler(BaseUDSHandler):
             ).model_dump()
         
         try:
-            registry.update_agent_tags(agent_name, organization, tags)
+            updated = registry.update_agent_tags(agent_name, organization, tags)
+            if not updated:
+                asyncio.run(audit_handle.handle({
+                    "operation_name": OperationName.UPDATE_TAGS,
+                    "level": LogLevel.MINOR,
+                    "result": OperationResult.FAILURE,
+                    "object_name": OperatorObject.AGENT,
+                    "details": details,
+                    "client_ip": "internal",
+                    "user_name": user_name
+                }))
+                logger.error(f"Failed to set tags for agent: {agent_name} ({organization}) - update rejected")
+                return InternalResponse(
+                    success=False,
+                    error="Failed to update tags",
+                    message=f"Tags were not updated for agent '{agent_name}' from organization '{organization}'"
+                ).model_dump()
+
             updated_tags = registry.get_agent_tags(agent_name, organization)
             
             details["updated_tags"] = updated_tags

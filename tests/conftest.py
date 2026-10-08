@@ -19,6 +19,15 @@ import psycopg2
 from a2a.types import AgentCard
 
 
+# Model definitions live outside the repository so that no credential can be
+# committed with them, so the suite cannot rely on the default path existing.
+# Point it at a checked-in, secret-free set unless the caller selected a file.
+os.environ.setdefault(
+    'LLM_CONFIG_FILE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'models.yaml'),
+)
+
+
 # ---------- DB availability gates ----------
 
 def _pg_available(config: dict) -> bool:

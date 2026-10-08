@@ -24,31 +24,41 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 
 
-class ConnectionLimitMiddleware(BaseHTTPMiddleware):
-    """Connection limit middleware"""
+class ConnectionLimitMiddleware:
+    """Limit active HTTP responses, including their entire streaming lifetime.
+
+    This is an ASGI response quota, not a TCP socket count. Non-HTTP scopes pass
+    through; completion, disconnect and cancellation all release the quota.
+    """
 
     def __init__(self, app, max_connections: int):
-        super().__init__(app)
+        self.app = app
         self.max_connections = max_connections
         self.active_connections = 0
         self._lock = asyncio.Lock()
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
         async with self._lock:
             if self.active_connections >= self.max_connections:
                 logger.error(f"The server is at maximum connection capacity. ({self.max_connections})")
-                return JSONResponse(
+                rejected = JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={
                         "code": status.HTTP_503_SERVICE_UNAVAILABLE,
                         "message": f"The server is at maximum connection capacity. ({self.max_connections})"
                     }
                 )
-            self.active_connections += 1
+            else:
+                rejected = None
+                self.active_connections += 1
+
+        if rejected is not None:
+            return await rejected(scope, receive, send)
 
         try:
-            response = await call_next(request)
-            return response
+            await self.app(scope, receive, send)
         finally:
             async with self._lock:
                 self.active_connections -= 1
