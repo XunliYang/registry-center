@@ -83,7 +83,7 @@ class MilvusDBClient(VectorDBClient):
 
             schema = self.client.create_schema(
                 auto_id=False,
-                enable_dynamic_fields=True,
+                enable_dynamic_field=True,
                 description=f"create collection named: {collection_name}",
             )
 
