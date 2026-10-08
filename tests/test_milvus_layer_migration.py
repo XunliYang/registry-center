@@ -107,6 +107,22 @@ def test_in_place_migration_backfills_unknown_and_preserves_embedding():
     assert client.entities["agents"][1]["embedding"] == [0.1, 0.2]
 
 
+def test_in_place_migration_preserves_vendor_defined_layer():
+    custom_layer = "vendor.custom-network-layer"
+    client = _MilvusDouble(
+        {"agents": _schema(_LAYER_FIELDS)},
+        {"agents": [_entity("custom", custom_layer)]},
+    )
+
+    result = migrate_in_place(client, "agents")
+
+    assert result.scanned == 1
+    assert result.updated == 0
+    assert result.unknown_assigned == 0
+    assert client.upserted == []
+    assert client.entities["agents"][0]["layer"] == custom_layer
+
+
 def test_rebuild_migration_copies_legacy_entities_to_layer_aware_collection():
     source_rows = [_entity("one"), _entity("two")]
     client = _MilvusDouble(

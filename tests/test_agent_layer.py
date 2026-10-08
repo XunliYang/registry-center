@@ -16,8 +16,8 @@ from google.protobuf.json_format import MessageToDict
 
 from agent_registry.core import RegistryCore
 from agent_registry.model.agent_layer import (
-    AgentLayer,
     LAYER_UNSET,
+    UNKNOWN_LAYER,
     normalize_layer,
     normalize_registration_item,
 )
@@ -47,12 +47,19 @@ def sample_card(name="layer-agent", organization="layer-org"):
 
 class TestLayerModel:
 
-    def test_layer_is_strict_and_case_sensitive(self):
-        assert normalize_layer(AgentLayer.OMC) == "omc"
+    def test_layer_accepts_vendor_defined_strings(self):
+        assert normalize_layer("omc") == "omc"
         assert normalize_layer("domain_workbench") == "domain_workbench"
-        for value in (None, "", "OMC", "unknown-layer", 1):
+        assert normalize_layer("Vendor Custom Layer") == "Vendor Custom Layer"
+        assert normalize_layer("OMC") == "OMC"
+        for value in (None, "", "   ", 1):
             with pytest.raises(ValueError):
                 normalize_layer(value)
+        assert UNKNOWN_LAYER == "unknown"
+
+    def test_layer_length_is_bounded_for_storage_backends(self):
+        with pytest.raises(ValueError):
+            normalize_layer("x" * 65)
 
     def test_registration_item_supports_legacy_and_wrapped_shapes(self):
         card = MessageToDict(sample_card(), preserving_proto_field_name=True)
@@ -101,14 +108,15 @@ class TestFileLayerStorage:
             str(tmp_path / "tags.json"),
         )
         card = sample_card()
-        assert storage.create(card, layer="omc") is True
-        assert storage.find_records(layer="omc")[0].layer == "omc"
+        custom_layer = "vendor.custom-network-layer"
+        assert storage.create(card, layer=custom_layer) is True
+        assert storage.find_records(layer=custom_layer)[0].layer == custom_layer
         assert storage.find_records(layer="unknown") == []
 
         data = MessageToDict(card, preserving_proto_field_name=True)
         data["description"] = "updated"
         assert storage.update(card.name, card.provider.organization, data) is True
-        assert storage.find_by_key(card.name, card.provider.organization).layer == "omc"
+        assert storage.find_by_key(card.name, card.provider.organization).layer == custom_layer
 
         assert storage.update(
             card.name, card.provider.organization, data, layer="unknown"
@@ -150,13 +158,12 @@ class TestSQLiteLayerStorage:
         assert "idx_agent_layer" in indexes
 
         card = sample_card()
-        assert storage.create(card, layer="cross_domain_coordination") is True
-        assert storage.find_records(layer="cross_domain_coordination")[0].layer == \
-            "cross_domain_coordination"
+        custom_layer = "vendor.custom-network-layer"
+        assert storage.create(card, layer=custom_layer) is True
+        assert storage.find_records(layer=custom_layer)[0].layer == custom_layer
         data = MessageToDict(card, preserving_proto_field_name=True)
         assert storage.update(card.name, card.provider.organization, data) is True
-        assert storage.find_by_key(card.name, card.provider.organization).layer == \
-            "cross_domain_coordination"
+        assert storage.find_by_key(card.name, card.provider.organization).layer == custom_layer
         storage.close()
 
     def test_existing_sqlite_table_gets_layer_column(self, tmp_path):
@@ -261,7 +268,7 @@ class TestLayerAwareEndpoints:
 
         with patch("common.custom.custom_handle.HandlerRegistry.get_handler", return_value=handler):
             response = TestClient(app).get(
-                "/rest/v1/registry-center/agent-registrations/layer-org/layer-agent"
+                "/rest/v1/registry-center/agent-cards-with-layer/layer-org/layer-agent"
             )
 
         assert response.status_code == 200
@@ -277,7 +284,7 @@ class TestLayerAwareEndpoints:
 
         with patch("common.custom.custom_handle.HandlerRegistry.get_handler", return_value=handler):
             response = TestClient(app).post(
-                "/rest/v1/registry-center/agent-registrations/query",
+                "/rest/v1/registry-center/agent-cards-with-layer",
                 json={"layer": "omc", "limit": 10},
             )
 
@@ -297,9 +304,27 @@ class TestLayerAwareEndpoints:
 
         with patch("common.custom.custom_handle.HandlerRegistry.get_handler", return_value=handler):
             response = TestClient(app).post(
-                "/rest/v1/registry-center/agent-registrations/query",
+                "/rest/v1/registry-center/agent-cards-with-layer",
                 json={"layer": "omc", "limit": 10},
             )
 
         assert response.status_code == 503
         assert "no layer field" in response.json()["errors"]["error"][0]["errorMessage"]
+
+    def test_semantic_layer_query_uses_dedicated_endpoint(self):
+        record = AgentRecord(agent_card=sample_card(), status="published", layer="vendor.layer")
+        registry, _, _ = self._dependencies(record)
+        handler = MagicMock()
+        handler.handle = AsyncMock(return_value=None)
+
+        with patch("common.custom.custom_handle.HandlerRegistry.get_handler", return_value=handler):
+            response = TestClient(app).post(
+                "/rest/v1/registry-center/agent-cards-with-layer/semantic-query",
+                json={"layer": "vendor.layer", "task": "find an agent", "topN": 5},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["agents"][0]["layer"] == "vendor.layer"
+        registry.retrieve_records_by_task.assert_called_once_with(
+            "find an agent", 5, layer="vendor.layer", status="published"
+        )

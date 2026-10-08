@@ -29,7 +29,7 @@ from google.protobuf.json_format import MessageToDict, Parse
 from loguru import logger
 
 from agent_registry.model.tag import Tag
-from agent_registry.model.agent_layer import AgentLayer, LAYER_UNSET, default_layer, normalize_layer
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, LAYER_UNSET, default_layer, normalize_layer
 from agent_registry.config import PERSISTENCE_FILE, PERSISTENCE_METADATA_FILE, USE_VECTORDB, COLLECTION_NAME, \
     PERSISTENCE_CONF, PERSISTENCE_MODE
 from agent_registry.persistence import StorageRegistry, StorageBackend
@@ -243,11 +243,11 @@ class RegistryCore:
                     continue
                 if organization is not None and organization != card.provider.organization:
                     continue
-                raw_layer = data.get("layer", AgentLayer.UNKNOWN.value)
+                raw_layer = data.get("layer", UNKNOWN_LAYER)
                 try:
                     stored_layer = normalize_layer(raw_layer)
                 except ValueError:
-                    stored_layer = AgentLayer.UNKNOWN.value
+                    stored_layer = UNKNOWN_LAYER
                 if layer is not None and stored_layer != layer:
                     continue
                 if status is not None and data.get("status", 'published') != status:
@@ -315,7 +315,7 @@ class RegistryCore:
                     name, organization, owner=owner, use_vectordb=True
                 )
                 if layer is LAYER_UNSET:
-                    layer = existing.layer if existing else AgentLayer.UNKNOWN.value
+                    layer = existing.layer if existing else UNKNOWN_LAYER
                 entity_str = json.dumps(agent_data)
                 embedding = self.embedding_tool.embed(agent_data["description"])
                 key = self._make_id(agent_data["name"], agent_data["provider"]["organization"])
@@ -540,11 +540,11 @@ class RegistryCore:
                 stored_owner = agent_data.get("owner")
                 if owner is not None and stored_owner not in (None, '', owner):
                     return None
-                raw_layer = agent_data.get("layer", AgentLayer.UNKNOWN.value)
+                raw_layer = agent_data.get("layer", UNKNOWN_LAYER)
                 try:
                     stored_layer = normalize_layer(raw_layer)
                 except ValueError:
-                    stored_layer = AgentLayer.UNKNOWN.value
+                    stored_layer = UNKNOWN_LAYER
                 return AgentRecord(
                     agent_card=card,
                     owner=stored_owner,
@@ -629,7 +629,7 @@ class RegistryCore:
             "organization": organization,
             "status": status,
             "tag": tags,
-            "layer": default_layer(getattr(record, "layer", AgentLayer.UNKNOWN.value)),
+            "layer": default_layer(getattr(record, "layer", UNKNOWN_LAYER)),
             "created_at": created_at,
             "updated_at": updated_at
         }

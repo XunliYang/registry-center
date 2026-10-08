@@ -13,7 +13,7 @@ be copied to a new collection created with the current registry schema.
 from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, List, Optional, Set
 
-from agent_registry.model.agent_layer import AgentLayer, normalize_layer
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, normalize_layer
 
 
 MIGRATION_OUTPUT_FIELDS = [
@@ -135,17 +135,17 @@ def _normalized_entity(entity: dict) -> tuple[dict, bool, bool]:
     """Return a copy with a valid layer and change/unknown flags."""
 
     result = dict(entity)
-    raw_layer = result.get("layer", AgentLayer.UNKNOWN.value)
+    raw_layer = result.get("layer", UNKNOWN_LAYER)
     try:
         layer = normalize_layer(raw_layer)
         changed = "layer" not in result or result.get("layer") != layer
         assigned_unknown = False
     except ValueError:
-        layer = AgentLayer.UNKNOWN.value
+        layer = UNKNOWN_LAYER
         changed = True
         assigned_unknown = True
     if "layer" not in result:
-        assigned_unknown = layer == AgentLayer.UNKNOWN.value
+        assigned_unknown = layer == UNKNOWN_LAYER
     result["layer"] = layer
     return result, changed, assigned_unknown
 

@@ -20,7 +20,7 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
 from a2a.types import AgentCard
-from agent_registry.model.agent_layer import AgentLayer, LAYER_UNSET
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, LAYER_UNSET
 from agent_registry.model.tag import Tag
 
 
@@ -32,7 +32,7 @@ class AgentRecord:
     created_at: str = ''
     updated_at: str = ''
     tags: List[str] = field(default_factory=list)
-    layer: str = AgentLayer.UNKNOWN.value
+    layer: str = UNKNOWN_LAYER
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,7 +54,7 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def create(self, agent: AgentCard, owner: Optional[str] = None,
-               status: str = 'published', layer: str = AgentLayer.UNKNOWN.value) -> bool:
+               status: str = 'published', layer: str = UNKNOWN_LAYER) -> bool:
         pass
 
     @abstractmethod

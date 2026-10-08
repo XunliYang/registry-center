@@ -541,8 +541,8 @@ _LAYER_QUERY_ROLES = (
 
 
 @integration_app.get(
-    "/integration/v1/agent-registrations/{organization}/{name}",
-    summary="Get an agent registration including its layer (integration)",
+    "/integration/v1/agent-cards-with-layer/{organization}/{name}",
+    summary="Get an agent card with its layer (integration)",
 )
 async def get_agent_registration(
         request: Request,
@@ -567,17 +567,36 @@ async def get_agent_registration(
 
 
 @integration_app.post(
-    "/integration/v1/agent-registrations/query",
-    summary="Query agent registrations by layer (integration)",
+    "/integration/v1/agent-cards-with-layer/semantic-query",
+    summary="Semantic query for agent cards with layer (integration)",
+)
+@integration_app.post(
+    "/integration/v1/agent-cards-with-layer",
+    summary="Query agent cards with layer (integration)",
 )
 async def query_agent_registrations(
         request: Request,
         principal: Principal = Depends(require_roles(
             *_LAYER_QUERY_ROLES, op_name=OperationName.QUERY_AGENT)),
 ):
-    """Query complete registration records through the integration port."""
+    """Query AgentCards with registration-layer metadata.
+
+    The collection endpoint handles ordinary queries.  Its
+    ``/semantic-query`` sibling requires a non-empty ``task``.
+    """
 
     query = _parse_layer_query_body(await request.json())
+    semantic_endpoint = request.url.path.endswith("/semantic-query")
+    if semantic_endpoint and not query["semantic"]:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "task is required for semantic queries",
+        )
+    if not semantic_endpoint and query["semantic"]:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "use the /semantic-query endpoint for task-based queries",
+        )
     registry = get_registry_dependency()
     operation = OperationName.RETRIEVE_AGENT if query["semantic"] else OperationName.QUERY_AGENT
 

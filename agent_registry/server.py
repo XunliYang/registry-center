@@ -64,7 +64,7 @@ from agent_registry.health import get_health_service, initialize_health_service
 from agent_registry.health.state import HealthStatus
 from agent_registry.model.validated_agentcard import validate_agent_card
 from agent_registry.model.agent_layer import (
-    AgentLayer,
+    UNKNOWN_LAYER,
     LAYER_UNSET,
     default_layer,
     normalize_layer,
@@ -552,7 +552,7 @@ def _registration_record_to_dict(record) -> dict:
 
     return {
         "agentCard": MessageToDict(record.agent_card),
-        "layer": default_layer(getattr(record, "layer", AgentLayer.UNKNOWN.value)),
+        "layer": default_layer(getattr(record, "layer", UNKNOWN_LAYER)),
     }
 
 
@@ -1120,9 +1120,9 @@ async def get_agent(
 
 
 @app.get(
-    "/rest/v1/registry-center/agent-registrations/{organization}/{name}",
+    "/rest/v1/registry-center/agent-cards-with-layer/{organization}/{name}",
     response_model=None,
-    summary="Get an agent registration including its layer",
+    summary="Get an agent card with its layer",
 )
 async def get_agent_registration(
         request: Request,
@@ -1152,18 +1152,39 @@ async def get_agent_registration(
 
 
 @app.post(
-    "/rest/v1/registry-center/agent-registrations/query",
+    "/rest/v1/registry-center/agent-cards-with-layer/semantic-query",
     response_model=None,
-    summary="Query agent registrations by layer",
+    summary="Semantic query for agent cards with layer",
+)
+@app.post(
+    "/rest/v1/registry-center/agent-cards-with-layer",
+    response_model=None,
+    summary="Query agent cards with layer",
 )
 async def query_agent_registrations(
         request: Request,
         registry: RegistryCore = Depends(get_registry),
         _: Any = Depends(RateLimiter('query')),
 ):
-    """Query complete registration records for orchestration callers."""
+    """Query AgentCards with registration-layer metadata.
+
+    The collection endpoint handles ordinary layer-aware queries.  Its
+    ``/semantic-query`` sibling handles task-based retrieval and requires a
+    non-empty ``task``.
+    """
 
     query = _parse_layer_query_body(await request.json())
+    semantic_endpoint = request.url.path.endswith("/semantic-query")
+    if semantic_endpoint and not query["semantic"]:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "task is required for semantic queries",
+        )
+    if not semantic_endpoint and query["semantic"]:
+        raise CustomHTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "use the /semantic-query endpoint for task-based queries",
+        )
     client_ip = request.client.host
     authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
     await authenticate_handle.handle(client_ip, request)

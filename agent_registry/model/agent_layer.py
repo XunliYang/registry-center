@@ -6,21 +6,11 @@
 """Registration metadata for the network layer assigned to an agent."""
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Dict
 
 
-class AgentLayer(str, Enum):
-    """The layer declared by an agent registration.
-
-    These values are deliberately kept outside ``AgentCard``.  They are
-    registry metadata and therefore do not participate in AgentCard signing.
-    """
-
-    OMC = "omc"
-    DOMAIN_WORKBENCH = "domain_workbench"
-    CROSS_DOMAIN_COORDINATION = "cross_domain_coordination"
-    UNKNOWN = "unknown"
+UNKNOWN_LAYER = "unknown"
+MAX_LAYER_LENGTH = 64
 
 
 # A separate sentinel is required for updates: an omitted layer preserves the
@@ -29,29 +19,29 @@ LAYER_UNSET = object()
 
 
 def normalize_layer(value: Any) -> str:
-    """Validate and return a layer token.
+    """Validate and return a vendor-defined layer string.
 
-    ``None``, an empty string and unknown tokens are rejected.  Callers that
-    need the update-preserve behaviour should check ``LAYER_UNSET`` before
-    calling this function.
+    Layer values are registry metadata rather than a shared industry enum.
+    Surrounding whitespace is removed and the stored value is limited to
+    ``MAX_LAYER_LENGTH`` characters. Callers that need the update-preserve
+    behaviour should check ``LAYER_UNSET`` before calling this function.
     """
 
-    if isinstance(value, AgentLayer):
-        return value.value
-    if not isinstance(value, str) or not value:
-        raise ValueError("layer must be a non-empty string enum value")
-    try:
-        return AgentLayer(value).value
-    except ValueError as exc:
-        values = ", ".join(layer.value for layer in AgentLayer)
-        raise ValueError(f"invalid layer '{value}', expected one of: {values}") from exc
+    if not isinstance(value, str):
+        raise ValueError("layer must be a string")
+    layer = value.strip()
+    if not layer:
+        raise ValueError("layer must be a non-empty string")
+    if len(layer) > MAX_LAYER_LENGTH:
+        raise ValueError(f"layer must not exceed {MAX_LAYER_LENGTH} characters")
+    return layer
 
 
 def default_layer(value: Any = LAYER_UNSET) -> str:
     """Return a normalized layer, treating an omitted value as unknown."""
 
     if value is LAYER_UNSET:
-        return AgentLayer.UNKNOWN.value
+        return UNKNOWN_LAYER
     return normalize_layer(value)
 
 

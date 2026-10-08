@@ -19,7 +19,7 @@ from google.protobuf.json_format import MessageToDict, Parse
 from loguru import logger
 
 from agent_registry.model.tag import Tag
-from agent_registry.model.agent_layer import AgentLayer, LAYER_UNSET, default_layer, normalize_layer
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, LAYER_UNSET, default_layer, normalize_layer
 from .base import StorageBackend, AgentRecord
 
 
@@ -162,11 +162,11 @@ class SqlStorageBackend(StorageBackend):
         tags = self._parse_tags(row[3]) if len(row) > 3 else []
         created_at = self._parse_timestamp(row[4]) if len(row) > 4 else ''
         updated_at = self._parse_timestamp(row[5]) if len(row) > 5 else ''
-        raw_layer = row[6] if len(row) > 6 else AgentLayer.UNKNOWN.value
+        raw_layer = row[6] if len(row) > 6 else UNKNOWN_LAYER
         try:
             stored_layer = normalize_layer(raw_layer)
         except ValueError:
-            stored_layer = AgentLayer.UNKNOWN.value
+            stored_layer = UNKNOWN_LAYER
         return AgentRecord(
             agent_card=agent, owner=stored_owner,
             status=stored_status, tags=tags,
@@ -188,7 +188,7 @@ class SqlStorageBackend(StorageBackend):
 
     def _get_agent_fields(self, agent: AgentCard, owner: Optional[str] = None,
                           status: str = 'published',
-                          layer: str = AgentLayer.UNKNOWN.value) -> tuple:
+                          layer: str = UNKNOWN_LAYER) -> tuple:
         agent_dict = MessageToDict(agent, preserving_proto_field_name=True)
         now = datetime.now(timezone.utc)
         layer = default_layer(layer)
@@ -215,7 +215,7 @@ class SqlStorageBackend(StorageBackend):
 
     def create(self, agent: AgentCard, owner: Optional[str] = None,
                status: str = 'published',
-               layer: str = AgentLayer.UNKNOWN.value) -> bool:
+               layer: str = UNKNOWN_LAYER) -> bool:
         existing = self.find_by_key(agent.name, agent.provider.organization)
         if existing:
             logger.warning(f"Agent already exists: {agent.name} (org={agent.provider.organization})")

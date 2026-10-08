@@ -132,9 +132,7 @@ class PostgreSQLQueries(str, Enum):
 
     NORMALIZE_LAYER = """
         UPDATE agent_card SET layer = 'unknown'
-        WHERE layer IS NULL OR layer NOT IN (
-            'omc', 'domain_workbench', 'cross_domain_coordination', 'unknown'
-        )
+        WHERE layer IS NULL OR TRIM(layer) = ''
     """
 
     CREATE_INDEX_OWNER = "CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_card(owner)"
@@ -291,9 +289,7 @@ class SQLiteQueries(str, Enum):
 
     NORMALIZE_LAYER = """
         UPDATE agent_card SET layer = 'unknown'
-        WHERE layer IS NULL OR layer NOT IN (
-            'omc', 'domain_workbench', 'cross_domain_coordination', 'unknown'
-        )
+        WHERE layer IS NULL OR TRIM(layer) = ''
     """
     CREATE_INDEX_OWNER = "CREATE INDEX IF NOT EXISTS idx_agent_owner ON agent_card(owner)"
 
@@ -515,9 +511,7 @@ class GaussDBQueries(str, Enum):
 
     NORMALIZE_LAYER = """
         UPDATE agent_card SET layer = 'unknown'
-        WHERE layer IS NULL OR layer NOT IN (
-            'omc', 'domain_workbench', 'cross_domain_coordination', 'unknown'
-        )
+        WHERE layer IS NULL OR TRIM(layer) = ''
     """
 
     DROP_OLD_UNIQUE_INDEX = """
@@ -783,9 +777,7 @@ class MySQLQueries(str, Enum):
 
     NORMALIZE_LAYER = """
         UPDATE agent_card SET layer = 'unknown'
-        WHERE layer IS NULL OR layer NOT IN (
-            'omc', 'domain_workbench', 'cross_domain_coordination', 'unknown'
-        )
+        WHERE layer IS NULL OR TRIM(layer) = ''
     """
 
     UPDATE_AGENT_LAYER = """

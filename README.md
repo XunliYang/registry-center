@@ -177,6 +177,9 @@ flowchart TB
 | `PUT` | `/rest/v1/registry-center/agent-cards/{org}/{name}` | Update an agent |
 | `DELETE` | `/rest/v1/registry-center/agent-cards/{org}/{name}` | Deregister an agent |
 | `POST` | `/rest/v1/registry-center/agent-cards/semantic-query` | Semantic search by task description |
+| `POST` | `/rest/v1/registry-center/agent-cards-with-layer` | Layer-aware AgentCard query |
+| `GET` | `/rest/v1/registry-center/agent-cards-with-layer/{org}/{name}` | Get an AgentCard with its layer |
+| `POST` | `/rest/v1/registry-center/agent-cards-with-layer/semantic-query` | Layer-aware semantic search |
 | `GET` | `/rest/v1/registry-center/keys` | Retrieve registry signing public keys (JWK Set) |
 | `POST` | `/rest/v1/registry-center/agent-cards/{org}/{name}/heartbeat` | Report agent heartbeat |
 | `GET` | `/rest/v1/registry-center/agents/health` | Query agent health status list |

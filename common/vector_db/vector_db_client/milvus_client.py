@@ -21,7 +21,7 @@ from pymilvus import MilvusClient, DataType, MilvusException
 from loguru import logger
 
 from agent_registry.config import AGENT_NUM_MAX
-from agent_registry.model.agent_layer import AgentLayer, normalize_layer
+from agent_registry.model.agent_layer import UNKNOWN_LAYER, normalize_layer
 from agent_registry.persistence.base import AgentRecord
 from agent_registry.persistence.milvus_layer_migration import (
     LayerMigrationRequiredError,
@@ -360,12 +360,12 @@ class MilvusDBClient(VectorDBClient):
             agent_card=Parse(json.dumps(card_data), AgentCard()),
             owner=entity.get("owner"),
             status=entity.get("status", "published"),
-            layer=entity.get("layer", AgentLayer.UNKNOWN.value),
+            layer=entity.get("layer", UNKNOWN_LAYER),
         )
         try:
             record.layer = normalize_layer(record.layer)
         except ValueError:
-            record.layer = AgentLayer.UNKNOWN.value
+            record.layer = UNKNOWN_LAYER
         return record
 
     def _query_records(self, collection_name, filter_expr, limit=None, offset=None):
