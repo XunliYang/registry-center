@@ -105,14 +105,41 @@ def load_conf_as_dict(conf_file: str) -> dict:
         return {}
 
 
+def canonical_env_name(key: str) -> str:
+    """
+    Return the REGISTRY_* spelling that maps back to ``key``.
+
+    Every key is reachable under this name, including keys that keep an
+    underscore inside a segment such as ``knowledge_graph.ratelimit``.
+    """
+    return "REGISTRY_" + key.upper().replace(".", "_")
+
+
 def apply_env_overrides(conf: Dict[str, Any]) -> None:
     """
     Override config values with REGISTRY_* environment variables.
-    Env var REGISTRY_FOO_BAR overrides config key 'foo.bar' or 'foobar'.
+
+    Env var REGISTRY_FOO_BAR overrides config key 'foo.bar' or 'foobar', and
+    every key is also reachable under its canonical spelling (see
+    canonical_env_name), so a key like 'integration.auth.static.hmac_key'
+    cannot be silently missed. A name that matches no key is stored under its
+    raw lowercase form, which handlers that read such names expect.
     """
     env_prefix = "REGISTRY_"
+    canonical = {}
+    # Dotted keys are registered first: when one name is the canonical spelling
+    # of both 'foo.bar' and a legacy 'foo_bar' key, the dotted key wins.
+    for key in conf:
+        if '.' in key:
+            canonical.setdefault(canonical_env_name(key), key)
+    for key in conf:
+        canonical.setdefault(canonical_env_name(key), key)
     for env_key, env_value in os.environ.items():
         if not env_key.startswith(env_prefix):
+            continue
+        target = canonical.get(env_key)
+        if target is not None:
+            conf[target] = env_value
             continue
         raw_key = env_key[len(env_prefix):].lower()
         config_key = raw_key.replace("_", ".")

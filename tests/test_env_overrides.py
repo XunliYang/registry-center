@@ -54,3 +54,44 @@ def test_unmapped_variable_is_kept_under_its_raw_name(monkeypatch):
     apply_env_overrides(conf)
 
     assert conf['not_a_config_key'] == 'value'
+
+
+def test_key_with_internal_underscore_is_reachable_under_its_canonical_name(monkeypatch):
+    """A key may keep an underscore inside a segment: knowledge_graph.ratelimit.
+
+    Replacing every underscore with a dot cannot spell that key, so before the
+    canonical mapping existed the override was stored under
+    'knowledge_graph_ratelimit' and the real key kept its file value.
+    """
+    monkeypatch.setenv('REGISTRY_KNOWLEDGE_GRAPH_RATELIMIT', '7/second')
+    conf = {'knowledge_graph.ratelimit': '100/second'}
+
+    apply_env_overrides(conf)
+
+    assert conf['knowledge_graph.ratelimit'] == '7/second'
+    assert 'knowledge_graph_ratelimit' not in conf
+
+
+def test_canonical_mapping_covers_auth_material_and_audit_sink_keys(monkeypatch):
+    monkeypatch.setenv('REGISTRY_INTEGRATION_AUTH_STATIC_HMAC_KEY', 'secret')
+    monkeypatch.setenv('REGISTRY_AUDIT_MYSQL_BATCH_SIZE', '25')
+    conf = {
+        'integration.auth.static.hmac_key': '',
+        'audit.mysql.batch_size': '50',
+    }
+
+    apply_env_overrides(conf)
+
+    assert conf['integration.auth.static.hmac_key'] == 'secret'
+    assert conf['audit.mysql.batch_size'] == '25'
+
+
+def test_dotted_key_wins_when_a_legacy_underscored_key_has_the_same_name(monkeypatch):
+    """REGISTRY_FOO_BAR targets 'foo.bar', not the legacy 'foo_bar' key."""
+    monkeypatch.setenv('REGISTRY_FOO_BAR', 'value')
+    conf = {'foo.bar': 'old', 'foo_bar': 'legacy'}
+
+    apply_env_overrides(conf)
+
+    assert conf['foo.bar'] == 'value'
+    assert conf['foo_bar'] == 'legacy'
