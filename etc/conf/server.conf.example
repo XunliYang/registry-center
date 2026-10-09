@@ -48,6 +48,8 @@ ssl_ca_certs=etc/ssl/trust.cer
 #ssl_crl_file=etc/ssl/revocationlist.crl
 
 # Registry signature configuration required
+# Development helper: python -m generate_selfsign_cert etc/sign_cert dataSigning
+# Keep signing keys separate from TLS keys; production keys come from your CA/PKI.
 registry.sign.enabled=true
 
 # Verify client certificate. Only the literal value false disables verification; every
@@ -62,16 +64,16 @@ forwarded_allow_ips=127.0.0.1
 # Certificate of the registry's own signing key, read from this local path to serve the
 # public JWK at GET /rest/v1/registry-center/keys and to derive the kid. Nothing is
 # downloaded from this value.
-jwk_cert_path=etc/ssl/server.cer
+jwk_cert_path=etc/sign_cert/sign.cer
 
 # PEM private key FILE (not a directory) that signs AgentCards; required together with
 # jwk_cert_path while registry.sign.enabled=true. When the file is missing the signer is
 # skipped and only an error is logged, so cards would be issued unsigned.
-jwk_private_key_path=etc/sign_cert
+jwk_private_key_path=etc/sign_cert/sign_key.pem
 
 # Path to the file read verbatim as the JWK private key passphrase; empty means the
 # key is unencrypted. Restrict it to the service account: it unlocks signing.
-jwk_private_key_password=''
+jwk_private_key_password=etc/sign_cert/cert_pwd
 
 # Enable vector database
 use_vectordb=False

@@ -989,9 +989,9 @@ Restart the service after changes; model clients are cached. Use `python -m scri
 | registry.sign.enabled | Sign AgentCards with the registry signing key | true |
 | verify_client | Require a client certificate; only the literal `false` disables verification | true |
 | forwarded_allow_ips | Comma-separated reverse-proxy addresses whose `X-Forwarded-*` headers are trusted; empty trusts no proxy | 127.0.0.1 |
-| jwk_cert_path | Signing certificate read from this local path, served as the public JWK and used to derive the `kid` | etc/ssl/server.cer |
-| jwk_private_key_path | PEM private key FILE that signs AgentCards; required together with `jwk_cert_path` while signing is enabled | etc/sign_cert |
-| jwk_private_key_password | Path to the file read verbatim as the private key passphrase; empty means the key is unencrypted | '' (empty) |
+| jwk_cert_path | Separate signing certificate, served as the public JWK and used to derive the `kid` | etc/sign_cert/sign.cer |
+| jwk_private_key_path | Signing PEM private key FILE, not a directory or a reused TLS key | etc/sign_cert/sign_key.pem |
+| jwk_private_key_password | Plaintext private-key passphrase file; leave empty only for unencrypted keys | etc/sign_cert/cert_pwd |
 | use_vectordb | Enable the vector database (replaces the authoritative store, so query endpoints return 503; see the warning above) | false |
 | startup.strict.storage | Refuse to start when `use_vectordb=true` leaves the registry without an authoritative record store; false logs the condition as a warning and continues | false |
 | signature_validation_enabled | Verify AgentCard signatures | true |

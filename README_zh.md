@@ -266,7 +266,11 @@ agent-registry> tag delete --id <uuid>            # 删除标签
 本项目仅交付源码，使用者需自行完成：
 
 1. **构建安装**：在 Linux 服务器上安装依赖
-2. **准备证书**：或使用 `python generate_selfsign_cert.py <目录> serverAuth` 生成调试用自签名证书
+2. **准备证书**：开发调试可用 `python -m generate_selfsign_cert etc/ssl serverAuth`。
+   会在默认 TLS 路径生成 `server.cer`、`server_key.pem`、`cert_pwd` 和 `trust.cer`，
+   并包含回环 SAN；所有已有输出禁止覆盖。明文口令与私钥一起保护，Windows 使用服务账号 ACL。
+   签名材料独立生成：`python -m generate_selfsign_cert etc/sign_cert dataSigning`，
+   与公开模板中的 `jwk_*` 路径匹配。
 3. **交互式配置**：`python -m agent_registry.init`
 4. **集成安全基础设施**：客户系统需提供认证、鉴权、用户管理、加解密、数据库等能力
 5. **权限最小化**：文件权限 `400`，目录权限 `700`，可执行 `.sh` 文件 `500`
