@@ -41,7 +41,23 @@
     "col_version": "Version",
     "col_skills_count": "Skills",
     "view_cards_btn": "Cards",
-    "view_table_btn": "Table"
+    "view_table_btn": "Table",
+    "col_status": "Publish Status",
+    "col_actions": "Actions",
+    "status_published": "Published",
+    "status_unpublished": "Unpublished",
+    "action_publish": "Publish Review",
+    "action_publishing": "Publishing…",
+    "action_approved": "Approved",
+    "review_title": "Review & Publish",
+    "col_agent": "Agent",
+    "review_remark_label": "Review Remarks",
+    "review_required": "required",
+    "review_remark_placeholder": "Enter the reason for approving this agent...",
+    "review_audit_hint": "This action will be recorded in the operation audit log.",
+    "review_cancel": "Cancel",
+    "review_confirm": "Confirm & Publish",
+    "action_view": "View"
   },
   "heartbeat": {
     "view_title": "Heartbeat Monitor",
@@ -91,7 +107,9 @@
     "copied": "Copied"
   },
   "toast": {
-    "load_failed": "Failed to load agents."
+    "load_failed": "Failed to load agents.",
+    "publish_success": "Agent published",
+    "publish_failed": "Publish failed"
   },
   "settings": {
     "title": "Server Connection",

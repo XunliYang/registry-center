@@ -29,6 +29,7 @@ import { ErrorBoundary } from '@/components/common/error_boundary/index.jsx';
 import AgentRegistry from '@/components/registry_center/index.jsx';
 import en from './locales/en.json';
 import zh from './locales/zh.json';
+import './index.css';
 
 // Merge this plugin's locale resources into the Portal's GLOBAL i18next instance.
 //

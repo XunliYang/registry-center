@@ -87,6 +87,29 @@ export async function getAgentCards(name, organization, injectedApi) {
     return client.get(`${REGISTRY_BASE()}/agent-cards`, { params })
 }
 
+// Management view: ALL agent cards (published + registered) with publishStatus
+export async function getAgentCardsManage(injectedApi) {
+    const client = injectedApi || api
+    return client.get(`${REGISTRY_BASE()}/agent-cards/manage`)
+}
+
+// Review/approve an agent: registered (unpublished) -> published.
+// remark (review reason) is required by the backend and recorded in the
+// operation audit log.
+export async function publishAgentCard(organization, name, remark, injectedApi) {
+    const encodedOrg = encodeURIComponent(organization)
+    const encodedName = encodeURIComponent(name)
+    const client = injectedApi || api
+    return client.post(`${REGISTRY_BASE()}/agent-cards/${encodedOrg}/${encodedName}/publish`, { remark })
+}
+
+// Operation audit log (review/publish actions)
+export async function getOperationLogs(limit, injectedApi) {
+    const client = injectedApi || api
+    const query = limit ? `?limit=${limit}` : ''
+    return client.get(`${REGISTRY_BASE()}/operation-logs${query}`)
+}
+
 export async function getAgentCard(name, organization, injectedApi) {
     const encodedOrg = encodeURIComponent(organization)
     const encodedName = encodeURIComponent(name)

@@ -27,7 +27,9 @@ and pluggable file or SQL persistence.
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from functools import partial
+import pathlib
 from typing import Optional, Tuple, Any, Dict
 
 import anyio
@@ -301,6 +303,50 @@ deregister_semaphore = anyio.Semaphore(_get_int_config(config, FLOW_CTL_PARALLEL
 jwk_semaphore = anyio.Semaphore(_get_int_config(config, FLOW_CTL_PARALLEL_JWK, 1))
 heartbeat_semaphore = anyio.Semaphore(_get_int_config(config, FLOW_CTL_PARALLEL_HEARTBEAT, 100))
 subscription_semaphore = anyio.Semaphore(_get_int_config(config, FLOW_CTL_PARALLEL_SUBSCRIPTION, 50))
+
+
+# ---------- Operation audit log ----------
+# Append-only JSONL audit trail for review/approval actions (publish review
+# etc.), stored next to the agent-card persistence file.
+
+def _operation_log_path() -> str:
+    data_file = config.get('file.path', 'data/agentcard.json')
+    return str(pathlib.Path(data_file).parent / 'operation_log.jsonl')
+
+
+def _append_operation_log(action: str, operator: str, detail: Dict[str, Any]) -> None:
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "operator": operator,
+        **detail,
+    }
+    try:
+        log_path = _operation_log_path()
+        pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        logger.info(f"Operation log recorded: {action} {detail} by {operator}")
+    except Exception as exc:
+        logger.error(f"Failed to write operation log: {exc}")
+
+
+def _read_operation_logs(limit: int = 500) -> list:
+    log_path = _operation_log_path()
+    if not pathlib.Path(log_path).exists():
+        return []
+    entries = []
+    with open(log_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries[-limit:]
+
 
 class CustomHTTPException(HTTPException):
     def __init__(self, status_code: int, error_message: str, extra: Optional[dict] = None):
@@ -1002,6 +1048,111 @@ async def list_agents_exact(
             published_agents.append(agent_dict)
         logger.info(f"Query agents result: {len(published_agents)} agents found")
         return {"agentCards": published_agents}
+
+
+@app.get(
+    "/rest/v1/registry-center/agent-cards/manage",
+    response_model=None,
+    summary="Management list: all agent cards with publish status",
+)
+async def list_agents_manage(
+        request: Request,
+        registry: RegistryCore = Depends(get_registry),
+        _: Any = Depends(RateLimiter('query')),
+):
+    """
+    Management view for the review workflow: returns ALL agent cards
+    (published AND registered/unpublished) with a `publishStatus` field
+    attached to every card ('published' or 'registered').
+    """
+    client_ip = request.client.host
+    logger.info(f"Manage list agents request: client={client_ip}")
+    authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
+    await authenticate_handle.handle(client_ip, request)
+
+    async with semaphore_guard(query_semaphore):
+        query_handle = HandlerRegistry.get_handler(InterfaceType.QUERY)
+        agents = await query_handle.handle(None, None)
+
+        result = []
+        for agent in agents:
+            status = registry.get_status(agent.name, agent.provider.organization) or 'published'
+            agent_dict = MessageToDict(agent)
+            agent_dict['publishStatus'] = status
+            result.append(agent_dict)
+        logger.info(f"Manage list agents result: {len(result)} agents")
+        return {"agentCards": result}
+
+
+@app.post(
+    "/rest/v1/registry-center/agent-cards/{organization}/{name}/publish",
+    response_model=None,
+    summary="Approve & publish an agent (requires review remark)",
+)
+async def publish_agent(
+        request: Request,
+        name: str = Path(..., description="Agent name"),
+        organization: str = Path(..., description="Agent organization"),
+        registry: RegistryCore = Depends(get_registry),
+        _: Any = Depends(RateLimiter('update')),
+):
+    """
+    Review/approve an agent: transition its status from 'registered'
+    (unpublished) to 'published'. Requires a non-empty review remark
+    (the reason for approving). Every action is recorded in the
+    operation audit log.
+    """
+    client_ip = request.client.host
+    logger.info(f"Publish agent request: name={name}, org={organization}, client={client_ip}")
+    authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
+    await authenticate_handle.handle(client_ip, request)
+
+    # Review remark is mandatory — it is the recorded reason for publishing.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    remark = str((body or {}).get('remark') or '').strip()
+    if not remark:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Review remark is required")
+
+    async with semaphore_guard(update_semaphore):
+        status_before = registry.get_status(name, organization)
+        if status_before is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"Agent not found: {organization}/{name}")
+        ok = registry.update_status(name, organization, 'published')
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail="Failed to update agent status")
+        _append_operation_log('publish_review', client_ip, {
+            'agent_name': name,
+            'organization': organization,
+            'from_status': status_before,
+            'to_status': 'published',
+            'remark': remark,
+        })
+        logger.info(f"Publish agent result: {organization}/{name} -> published")
+        return {"status": "success", "publishStatus": "published"}
+
+
+@app.get(
+    "/rest/v1/registry-center/operation-logs",
+    response_model=None,
+    summary="Query the operation audit log (review/publish actions)",
+)
+async def get_operation_logs(
+        request: Request,
+        limit: int = Query(500, ge=1, le=5000, description="Max entries returned"),
+        _: Any = Depends(RateLimiter('query')),
+):
+    """Return the recorded operation audit log entries (oldest first)."""
+    client_ip = request.client.host
+    authenticate_handle = HandlerRegistry.get_handler(InterfaceType.AUTHENTICATE)
+    await authenticate_handle.handle(client_ip, request)
+    entries = _read_operation_logs(limit)
+    return {"operationLogs": entries}
 
 
 @app.put("/rest/v1/registry-center/agent-cards/{organization}/{name}", summary="Full update(replace) an agent")
