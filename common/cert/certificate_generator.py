@@ -16,6 +16,8 @@
 #    under the License.
 import os
 import datetime
+import ipaddress
+import re
 from typing import List
 from pathlib import Path
 
@@ -43,10 +45,37 @@ class CertificateGenerator:
     ISSUER = "agent-registry"
     SUBJECT = "agent-registry"
 
-    def __init__(self, key_algorithm: str = 'RSA'):
+    def __init__(self, key_algorithm: str = 'RSA', *,
+                 dns_names: list[str] | None = None, ip_addresses: list[str] | None = None):
+        """Use loopback SANs by default; explicit lists replace the complete SAN set."""
         self.key_algorithm = key_algorithm
-        self.password_generator = PasswordGenerator()
         self.alg = key_algorithm
+        self.password_generator = PasswordGenerator()
+        local_defaults = dns_names is None and ip_addresses is None
+        self.dns_names = ["localhost"] if local_defaults else list(dns_names or [])
+        self.ip_addresses = ["127.0.0.1", "::1"] if local_defaults else list(ip_addresses or [])
+
+    def _server_san(self) -> x509.SubjectAlternativeName:
+        names = []
+        for value in self.dns_names:
+            name = value.rstrip(".").encode("idna").decode("ascii").lower()
+            labels = name.split(".")
+            if labels[0] == "*":
+                labels = labels[1:]
+            if not labels or len(name) > 253 or any(
+                    not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    for label in labels):
+                raise ValueError("DNS SAN must be a hostname, not a URL or host:port")
+            try:
+                ipaddress.ip_address(name)
+            except ValueError:
+                names.append(x509.DNSName(name))
+            else:
+                raise ValueError("IP addresses must use ip_addresses / --ip, not DNS SAN")
+        names.extend(x509.IPAddress(ipaddress.ip_address(value)) for value in self.ip_addresses)
+        if not names:
+            raise ValueError("A serverAuth certificate requires at least one DNS or IP SAN")
+        return x509.SubjectAlternativeName(list(dict.fromkeys(names)))
 
     def generate_certificates(self, cert_dir: str, cert_usage: List[str]) -> bool:
         """
@@ -84,6 +113,10 @@ class CertificateGenerator:
         :return: True on success, False on failure. False if certificates already exist in the target directory.
         """
         try:
+            if cert_usage not in ("serverAuth", "dataSigning"):
+                raise ValueError("Certificate usage must be serverAuth or dataSigning")
+            if cert_usage == "serverAuth":
+                self._server_san()  # Validate identities before any write.
             if self._check_self_signed_certificates_exists(cert_dir):
                 return False
 
@@ -122,12 +155,12 @@ class CertificateGenerator:
         :return: True if either of the two files exists, False otherwise.
         """
         cert_file = f"server_{self.alg}.cer"
-        key_file = f"server_key_{self.alg}.cer"
+        key_file = f"server_key_{self.alg}.pem"
 
         cert_path = os.path.join(cert_dir, cert_file)
         key_path = os.path.join(cert_dir, key_file)
 
-        return os.path.exists(cert_path) or os.path.exists(key_path)
+        return os.path.lexists(cert_path) or os.path.lexists(key_path)
 
     def _generate_key(self) -> PrivateKeyTypes:
         """
@@ -225,12 +258,6 @@ class CertificateGenerator:
             f.write(encrypted_password)
 
     def _save_self_signed_cert(self, cert_dir: str, private_key: PrivateKeyTypes, cert_usage: str) -> None:
-        """
-        Use the private key to generate a self-signed certificate (new API).
-        :param cert_dir: Certificate directory path.
-        :param private_key: Private key object.
-        :param cert_usage: Certificate usage, serverAuth or dataSigning.
-        """
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, self.SUBJECT),
         ])
@@ -238,9 +265,9 @@ class CertificateGenerator:
         builder = x509.CertificateBuilder()
         builder = builder.subject_name(subject)
         builder = builder.issuer_name(issuer)
-        builder = builder.not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        builder = builder.not_valid_before(datetime.datetime.now(datetime.UTC))
         builder = builder.not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=self.VALID_YEARS * 365)
+            datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=self.VALID_YEARS * 365)
         )
         builder = builder.serial_number(x509.random_serial_number())
         builder = builder.public_key(private_key.public_key())
@@ -256,6 +283,10 @@ class CertificateGenerator:
             digital_signature = True
             content_commitment = True
 
+        # In the development-only serverAuth profile, the self-signed cert
+        # anchors its own trust so it can issue local client certificates.
+        # dataSigning remains a least-privilege leaf certificate.
+        acts_as_local_ca = cert_usage == "serverAuth"
         builder = builder.add_extension(
             x509.KeyUsage(
                 digital_signature=digital_signature,
@@ -263,8 +294,8 @@ class CertificateGenerator:
                 key_encipherment=key_encipherment,
                 data_encipherment=False,
                 key_agreement=False,
-                key_cert_sign=False,
-                crl_sign=False,
+                key_cert_sign=acts_as_local_ca,
+                crl_sign=acts_as_local_ca,
                 encipher_only=False,
                 decipher_only=False
             ),
@@ -272,13 +303,20 @@ class CertificateGenerator:
         )
 
         if cert_usage == "serverAuth":
+            # clientAuth in the EKU lets this self-signed cert act as the issuer
+            # of client certificates: OpenSSL's sslclient purpose check rejects
+            # a chain whose issuing CA lacks clientAuth.
             builder = builder.add_extension(
-                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]),
                 critical=False
             )
+            builder = builder.add_extension(self._server_san(), critical=False)
 
         builder = builder.add_extension(
-            x509.BasicConstraints(ca=False, path_length=None),
+            x509.BasicConstraints(
+                ca=acts_as_local_ca,
+                path_length=0 if acts_as_local_ca else None,
+            ),
             critical=True
         )
 
@@ -286,21 +324,17 @@ class CertificateGenerator:
 
         cert_file = f"server_{self.alg}.cer"
         cert_path = os.path.join(cert_dir, cert_file)
-        with open(cert_path, "wb") as f:
+        fd = os.open(cert_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
             f.write(certificate.public_bytes(serialization.Encoding.PEM))
 
     def _save_encrypted_key_with_password(self, cert_dir: str, private_key: PrivateKeyTypes, password: str) -> None:
-        """
-        Encrypt the private key using user-provided password and save it.
-        :param cert_dir: Certificate directory path.
-        :param private_key: Private key object.
-        :param password: Encryption password.
-        """
         encryption_algorithm = serialization.BestAvailableEncryption(password.encode())
 
         key_file = f"server_key_{self.alg}.pem"
         key_path = os.path.join(cert_dir, key_file)
-        with open(key_path, "wb") as f:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
             f.write(private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
@@ -308,12 +342,8 @@ class CertificateGenerator:
             ))
 
     def _set_self_signed_file_permissions(self, cert_dir: str) -> None:
-        """
-        Set self-signed certificate file permissions to 600.
-        :param cert_dir: Certificate directory path.
-        """
         cert_file = f"server_{self.alg}.cer"
-        key_file = f"server_key_{self.alg}.cer"
+        key_file = f"server_key_{self.alg}.pem"
 
         cert_path = os.path.join(cert_dir, cert_file)
         key_path = os.path.join(cert_dir, key_file)

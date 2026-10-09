@@ -415,36 +415,50 @@ Treat the subscription `secret` as a credential: database access permissions sho
 
 ## Self-Signed Certificate Generation Tool
 
-Provides a standalone tool for generating self-signed certificates for debugging scenarios. Note that such certificates must not be used in production environments.<br>
-When executing the tool from the command line, you must specify the certificate path, private key password, and certificate purpose.<br>
-Where:<br>
-- The certificate path supports relative path input, relative to the directory where generate_selfsign_cert.py is located<br>
-- The private key password is entered interactively<br>
+Development/debugging only. Production certificates must come from a trusted CA/enterprise PKI;
+this helper is not a production certificate manager. Run from the repository root; output paths
+are relative to the current working directory. Enter the password interactively, never as a CLI argument.
 
-Two certificate purposes are supported: serverAuth and dataSigning. The generated certificates differ in key usage and extended key usage:<br>
-1. serverAuth: Generates a TLS communication certificate<br>
-Certificate key usage: digital signature, key encipherment<br>
-Extended key usage: server authentication<br>
-Command line example:<br>
 ```bash
-# python generate_selfsign_cert.py {certificate directory} {certificate type}
-python generate_selfsign_cert.py testDir serverAuth
+# TLS: matches the four default server.conf paths
+python -m generate_selfsign_cert etc/ssl serverAuth
+# Explicit SANs replace the entire default set
+python -m generate_selfsign_cert etc/ssl-new serverAuth --dns registry.example.test --ip 192.0.2.10
+# mTLS: issue a separate client certificate from existing development server material
+python -m generate_selfsign_cert etc/ssl serverAuth --issue-client demo
+# Independent signing material: matches server.conf.example jwk_* settings
+python -m generate_selfsign_cert etc/sign_cert dataSigning
 ```
 
-2. dataSigning: Generates a signing certificate<br>
-Certificate key usage: digital signature, non-repudiation<br>
-Command line example:
-```bash
-mkdir testDir
-# python generate_selfsign_cert.py {certificate directory} {certificate type}
-python generate_selfsign_cert.py testDir dataSigning
-Enter private key password:
-Private key password complexity is low (At least 8 characters), continue using this password? (y/n):  y
-Successfully generated self-signed certificates in testDir
+TLS exports `server.cer`, `server_key.pem`, `cert_pwd` and `trust.cer`.
+Default SANs are `localhost`, `127.0.0.1` and `::1`; the trust anchor is a copy of
+the self-signed server certificate. This development-only server profile has local CA capability
+(CA:TRUE, keyCertSign and serverAuth/clientAuth) to issue development client certificates.
+Client issuance exports `demo-client.cer` and unencrypted `demo-client.key`.
+Configure those in the calling client and trust `trust.cer`. The tool never changes `verify_client`.
+For nginx's unencrypted server key, select `--plain-key` on initial generation into a new directory.
+
+dataSigning exports `sign.cer`, `sign_key.pem` and `cert_pwd`, without SANs or CA capability.
+Use separate directories and key pairs for signing and TLS. The runtime uses these actual keys:
+
+```ini
+jwk_cert_path=etc/sign_cert/sign.cer
+jwk_private_key_path=etc/sign_cert/sign_key.pem
+jwk_private_key_password=etc/sign_cert/cert_pwd
 ```
 
-Upon successful execution, a PEM-encoded X.509v3 self-signed certificate will be generated in the specified path:<br>
-The certificate key algorithm is RSA, with a key length of 3072, a certificate validity period of 99 years, issuer and subject (CN field of both issuer and subject) are both agent-registry, SAN is not set. Certificate file permissions are 600, and the directory permissions are 700.<br>
+Both profiles retain `server_RSA.cer` and `server_key_RSA.pem` for compatibility.
+Keys are RSA 3072; the development certificate lifetime is 99 years, not a production lifetime policy.
+`cert_pwd` contains the plaintext password without a trailing newline, readable by both the TLS loader
+and AgentCardSigner. Storing a password beside its encrypted key provides no additional at-rest
+protection: protect the entire directory as a credential. New directories/files use POSIX 700/600;
+on Windows restrict access using service-account ACLs. Never commit certificates, keys or passwords.
+
+Any existing output file, directory or symlink prevents overwrite, including deployment copies,
+passwords, optional plaintext keys and client material. For rotation, generate into a new directory,
+reissue clients, redistribute trust and deploy matching certificate/key/password files.
+For non-default directories explicitly configure every `ssl_*` or `jwk_*` path.
+Existing `server.conf` is never rewritten; update old signing settings manually to actual file paths.
 
 ## Appendix: Complete Blacklist
 

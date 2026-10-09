@@ -257,7 +257,11 @@ python -m agent_registry.init
 This project is delivered as **source code only**. Users are responsible for:
 
 1. **Build & install** dependencies on a Linux server
-2. **Provision TLS certificates** (or generate self-signed test certs via `python generate_selfsign_cert.py <dir> serverAuth`)
+2. **Provision TLS certificates** (development only: `python -m generate_selfsign_cert etc/ssl serverAuth`).
+   This writes `server.cer`, `server_key.pem`, `cert_pwd` and `trust.cer` at the default TLS paths,
+   with loopback SANs. Existing outputs are never overwritten; protect the plaintext password
+   and keys (service-account ACLs on Windows). Keep signing material separate:
+   `python -m generate_selfsign_cert etc/sign_cert dataSigning` matches the public `jwk_*` template.
 3. **Configure** via `python -m agent_registry.init`
 4. **Integrate** authentication, authorization, and database infrastructure from the host system
 5. **Set minimal file permissions** (e.g., files `400`, directories `700`)
