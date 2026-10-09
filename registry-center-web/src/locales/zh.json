@@ -41,7 +41,23 @@
     "col_version": "版本",
     "col_skills_count": "技能数",
     "view_cards_btn": "卡片",
-    "view_table_btn": "表格"
+    "view_table_btn": "表格",
+    "col_status": "发布状态",
+    "col_actions": "操作",
+    "status_published": "发布",
+    "status_unpublished": "未发布",
+    "action_publish": "发布审核",
+    "action_publishing": "发布中…",
+    "action_approved": "已审核",
+    "review_title": "审核发布",
+    "col_agent": "Agent",
+    "review_remark_label": "审核备注",
+    "review_required": "必填",
+    "review_remark_placeholder": "请填写审核发布的原因...",
+    "review_audit_hint": "本次操作将记录到操作日志",
+    "review_cancel": "取消",
+    "review_confirm": "确认发布",
+    "action_view": "查看"
   },
   "heartbeat": {
     "view_title": "心跳监控",
@@ -91,7 +107,9 @@
     "copied": "已复制"
   },
   "toast": {
-    "load_failed": "加载 Agent 失败。"
+    "load_failed": "加载 Agent 失败。",
+    "publish_success": "审核通过，Agent 已发布",
+    "publish_failed": "发布操作失败"
   },
   "settings": {
     "title": "服务连接",

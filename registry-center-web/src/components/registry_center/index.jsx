@@ -40,8 +40,11 @@ import {
     HeartPulse,
     LayoutGrid,
     List,
+    ShieldCheck,
+    Clock,
+    Eye,
 } from 'lucide-react'
-import { getAgentCards, getAgentsHealth } from '@/service/api.js'
+import { getAgentCardsManage, getAgentsHealth, publishAgentCard } from '@/service/api.js'
 import { useHealthPolling } from '@/hooks/use_health_polling.js'
 import AgentCard from './agentcard_visualization/index.jsx'
 import CodeInspector from './code_inspector/index.jsx'
@@ -131,7 +134,7 @@ const StatsBar = ({ agents, isDark }) => {
 
 // ── Table row view ──
 
-const renderTableRow = (agent, setSelectedAgent, setViewMode, themeColor, layerBadge, t, healthOf) => {
+const renderTableRow = (agent, setSelectedAgent, setViewMode, themeColor, layerBadge, t, healthOf, openReview, publishingKey) => {
     const health = healthOf(agent.id, agent.provider?.organization)
     return (
         <tr
@@ -189,6 +192,48 @@ const renderTableRow = (agent, setSelectedAgent, setViewMode, themeColor, layerB
             <td className="px-4 py-3">
                 {health && <StatusBadge status={health} pulse={health === 'suspect'} />}
             </td>
+            <td className="px-4 py-3">
+                {agent.publishStatus === 'published' ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-900/30 dark:border-emerald-800 dark:text-emerald-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        {t('registry.status_published')}
+                    </span>
+                ) : (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-900/30 dark:border-amber-800 dark:text-amber-400">
+                        <Clock size={10} />
+                        {t('registry.status_unpublished')}
+                    </span>
+                )}
+            </td>
+            <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => {
+                            setSelectedAgent(agent)
+                            setViewMode('structured')
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-black bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700 transition-colors"
+                    >
+                        <Eye size={12} />
+                        {t('registry.action_view')}
+                    </button>
+                    {agent.publishStatus === 'published' ? (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold text-zinc-300 dark:text-zinc-600 uppercase">
+                            <CheckCircle2 size={12} />
+                            {t('registry.action_approved')}
+                        </span>
+                    ) : (
+                        <button
+                            disabled={publishingKey === agent.id}
+                            onClick={() => openReview(agent)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-black bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-wait text-white shadow-sm transition-colors"
+                        >
+                            <ShieldCheck size={12} />
+                            {publishingKey === agent.id ? t('registry.action_publishing') : t('registry.action_publish')}
+                        </button>
+                    )}
+                </div>
+            </td>
         </tr>
     )
 }
@@ -201,7 +246,7 @@ const AgentRegistry = ({ isDark, api }) => {
     const [activeTab, setActiveTab] = useState('all')
     const [selectedAgent, setSelectedAgent] = useState(null)
     const [viewMode, setViewMode] = useState('structured')
-    const [listMode, setListMode] = useState('cards')
+    const [listMode, setListMode] = useState('table')
     const [view, setView] = useState('registry')
 
     const [toast, setToast] = useState(null)
@@ -217,7 +262,7 @@ const AgentRegistry = ({ isDark, api }) => {
         try {
             // injectedApi: Portal plugin mode (PortalContext.api); standalone
             // mode omits it and uses the local service instance.
-            const response = await getAgentCards(undefined, undefined, api)
+            const response = await getAgentCardsManage(api)
             const rawList = response?.agentCards || []
             const enhancedData = rawList.map((val) => {
                 const key = val.name
@@ -234,6 +279,7 @@ const AgentRegistry = ({ isDark, api }) => {
                     displayName: key.toUpperCase(),
                     ...ui,
                     layer,
+                    publishStatus: val.publishStatus || 'published',
                     _raw: { ...syncedRaw, skills: modifiedSkills },
                 }
             })
@@ -280,6 +326,39 @@ const AgentRegistry = ({ isDark, api }) => {
         },
         [heartbeatEnabled, healthMap],
     )
+
+    // ── Publish review: registered (unpublished) -> published ──
+    const [publishingKey, setPublishingKey] = useState(null)
+    const [reviewTarget, setReviewTarget] = useState(null)
+    const [reviewRemark, setReviewRemark] = useState('')
+
+    const openReview = useCallback((agent) => {
+        setReviewRemark('')
+        setReviewTarget(agent)
+    }, [])
+
+    const closeReview = useCallback(() => {
+        setReviewTarget(null)
+        setReviewRemark('')
+    }, [])
+
+    const handlePublish = useCallback(async () => {
+        const agent = reviewTarget
+        if (!agent) return
+        const remark = reviewRemark.trim()
+        if (!remark) return
+        setPublishingKey(agent.id)
+        try {
+            await publishAgentCard(agent.provider?.organization, agent.id, remark, api)
+            showToast('toast.publish_success', 'success')
+            closeReview()
+            await fetchData()
+        } catch (_e) {
+            showToast('toast.publish_failed', 'error')
+        } finally {
+            setPublishingKey(null)
+        }
+    }, [api, reviewTarget, reviewRemark, showToast, closeReview, fetchData])
 
     const filteredAgents = useMemo(() => {
         let result = agents
@@ -590,6 +669,8 @@ const AgentRegistry = ({ isDark, api }) => {
                                                     t('registry.col_version'),
                                                     t('registry.col_skills_count'),
                                                     t('heartbeat.col_status'),
+                                                    t('registry.col_status'),
+                                                    t('registry.col_actions'),
                                                 ].map((h) => (
                                                     <th
                                                         key={h}
@@ -605,14 +686,14 @@ const AgentRegistry = ({ isDark, api }) => {
                                                 ? Object.values(vendorGroups).flat()
                                                 : filteredAgents
                                             ).map((agent) =>
-                                                renderTableRow(agent, setSelectedAgent, setViewMode, themeColor, layerBadge, t, healthOf),
+                                                renderTableRow(agent, setSelectedAgent, setViewMode, themeColor, layerBadge, t, healthOf, openReview, publishingKey),
                                             )}
                                             {(activeTab === 'vendor'
                                                 ? Object.values(vendorGroups).flat()
                                                 : filteredAgents
                                             ).length === 0 && (
                                                 <tr>
-                                                    <td colSpan={7} className="py-16 text-center text-zinc-400 text-sm font-bold">
+                                                    <td colSpan={9} className="py-16 text-center text-zinc-400 text-sm font-bold">
                                                         {t('registry.no_agents')}
                                                     </td>
                                                 </tr>
@@ -791,6 +872,76 @@ const AgentRegistry = ({ isDark, api }) => {
                     document.body,
                 )}
             </AnimatePresence>
+
+            {/* Publish review dialog — requires a review remark (reason) */}
+            {reviewTarget && createPortal(
+                <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/40 dark:bg-black/60 backdrop-blur-sm">
+                    <div className="bg-white dark:bg-zinc-950 w-full max-w-lg rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 overflow-hidden">
+                        <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between">
+                            <div className="flex items-center gap-2.5">
+                                <div className="p-2 rounded-lg bg-blue-600 text-white shadow-sm">
+                                    <ShieldCheck size={16} />
+                                </div>
+                                <h3 className="text-base font-black text-zinc-900 dark:text-white">
+                                    {t('registry.review_title')}
+                                </h3>
+                            </div>
+                            <button onClick={closeReview} className="p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
+                                <X size={16} className="text-zinc-400" />
+                            </button>
+                        </div>
+
+                        <div className="px-6 py-5 space-y-4">
+                            <div className="flex items-center gap-2 text-sm">
+                                <span className="text-zinc-400 font-bold">{t('registry.col_agent')}</span>
+                                <span className="font-black text-zinc-900 dark:text-white">{reviewTarget.id}</span>
+                                <span className="text-zinc-300 dark:text-zinc-700">/</span>
+                                <span className="text-xs font-bold text-zinc-500 dark:text-zinc-400">{reviewTarget.provider?.organization}</span>
+                            </div>
+
+                            <div>
+                                <label className="flex items-center gap-1 text-xs font-black uppercase tracking-wider text-zinc-500 dark:text-zinc-400 mb-2">
+                                    {t('registry.review_remark_label')}
+                                    <span className="text-red-500">*</span>
+                                    <span className="text-[9px] font-bold text-zinc-300 dark:text-zinc-600 normal-case">
+                                        ({t('registry.review_required')})
+                                    </span>
+                                </label>
+                                <textarea
+                                    autoFocus
+                                    value={reviewRemark}
+                                    onChange={(e) => setReviewRemark(e.target.value)}
+                                    placeholder={t('registry.review_remark_placeholder')}
+                                    rows={4}
+                                    maxLength={500}
+                                    className="w-full px-3.5 py-2.5 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm font-medium text-zinc-900 dark:text-white placeholder-zinc-400 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400 outline-none transition-all resize-none"
+                                />
+                                <p className="mt-1.5 text-[10px] font-bold text-zinc-400 dark:text-zinc-500">
+                                    {t('registry.review_audit_hint')}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800 flex items-center justify-end gap-2.5">
+                            <button
+                                onClick={closeReview}
+                                className="px-4 py-2 rounded-xl text-xs font-black text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                            >
+                                {t('registry.review_cancel')}
+                            </button>
+                            <button
+                                disabled={!reviewRemark.trim() || publishingKey === reviewTarget.id}
+                                onClick={handlePublish}
+                                className="px-4 py-2 rounded-xl text-xs font-black bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white shadow-md shadow-blue-500/20 transition-colors inline-flex items-center gap-1.5"
+                            >
+                                <ShieldCheck size={13} />
+                                {publishingKey === reviewTarget.id ? t('registry.action_publishing') : t('registry.review_confirm')}
+                            </button>
+                        </div>
+                    </div>
+                </div>,
+                document.body,
+            )}
         </div>
     )
 }
